@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -291,7 +292,7 @@ def _build_boundaries(
 
 
 def _plot_with_boundaries(
-    ax: object,
+    ax: Any,
     x: NDArray[np.float64],
     y: NDArray[np.float64],
     boundaries: Sequence[SegmentBoundary],
@@ -328,7 +329,12 @@ def _scale_positions(
     raise ValueError(f"Unsupported units '{units}'. Use 'm', 'cm', or 'mm'.")
 
 
-def _subplots(rows: int, cols: int, *, figsize: tuple[float, float]):
+def _subplots(
+    rows: int,
+    cols: int,
+    *,
+    figsize: tuple[float, float],
+) -> tuple[Any, Any]:
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -340,7 +346,7 @@ def _subplots(rows: int, cols: int, *, figsize: tuple[float, float]):
 
 
 def _finalize_figure(
-    fig: object,
+    fig: Any,
     *,
     show: bool,
     save_path: str | Path | None,

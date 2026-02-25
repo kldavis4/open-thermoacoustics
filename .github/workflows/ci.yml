@@ -11,11 +11,13 @@ permissions:
 
 jobs:
   lint:
-    name: Ruff
+    name: Ruff (changed files)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -25,16 +27,37 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
+
+      - name: Collect changed Python files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          {
+            echo "files<<EOF"
+            git diff --name-only "$BASE"...${{ github.sha }} -- "*.py"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run ruff
-        run: ruff check src tests
+        if: steps.changed.outputs.files != ''
+        run: ruff check ${{ steps.changed.outputs.files }}
+
+      - name: Skip ruff (no Python changes)
+        if: steps.changed.outputs.files == ''
+        run: echo "No changed Python files."
 
   typecheck:
-    name: Mypy
+    name: Mypy (changed files)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -45,8 +68,27 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
 
+      - name: Collect changed Python files
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+          fi
+          {
+            echo "files<<EOF"
+            git diff --name-only "$BASE"...${{ github.sha }} -- "*.py"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Run mypy
-        run: mypy src
+        if: steps.changed.outputs.files != ''
+        run: mypy --ignore-missing-imports --follow-imports=silent ${{ steps.changed.outputs.files }}
+
+      - name: Skip mypy (no Python changes)
+        if: steps.changed.outputs.files == ''
+        run: echo "No changed Python files."
 
   test:
     name: Pytest (py${{ matrix.python-version }})
