@@ -1,0 +1,53 @@
+name: Validation Scripts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1"
+  push:
+    branches:
+      - main
+    paths:
+      - "examples/validation/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/validation-scripts.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validation:
+    name: Run validation scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev,viz,config]"
+
+      - name: Run validation suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          failures=0
+          for script in examples/validation/*.py; do
+            echo "Running ${script}"
+            if ! python "${script}"; then
+              echo "FAILED: ${script}"
+              failures=$((failures + 1))
+            fi
+          done
+
+          if [[ "${failures}" -ne 0 ]]; then
+            echo "Validation failures: ${failures}"
+            exit 1
+          fi
