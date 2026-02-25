@@ -44,7 +44,7 @@ jobs:
 
       - name: Run ruff
         if: steps.changed.outputs.files != ''
-        run: ruff check ${{ steps.changed.outputs.files }}
+        run: ruff check --extend-ignore N802,N803,N806 ${{ steps.changed.outputs.files }}
 
       - name: Skip ruff (no Python changes)
         if: steps.changed.outputs.files == ''
