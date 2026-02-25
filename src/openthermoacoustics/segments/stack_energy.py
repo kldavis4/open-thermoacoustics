@@ -566,8 +566,13 @@ class StackEnergy(Segment):
         U1 = complex(y[2], y[3])
         T_m = y[4]
 
-        # Ensure temperature stays positive
-        T_m = max(T_m, 50.0)  # Minimum 50 K to avoid numerical issues
+        # Guard temperature range to avoid pathological stiffness.
+        # The ODE state can still drift outside this range, but we compute
+        # derivatives at bounded thermodynamic states and prevent runaway
+        # cooling/heating beyond these limits.
+        T_floor = 50.0
+        T_ceiling = 2000.0
+        T_m = min(max(T_m, T_floor), T_ceiling)
 
         # Gas properties at local temperature
         rho_m = gas.density(T_m)
@@ -585,6 +590,10 @@ class StackEnergy(Segment):
         if H2_total is None:
             raise ValueError("H2_total must be provided for integration")
         dT_dx = self._compute_dT_dx(p1, U1, T_m, omega, gas, H2_total)
+        if y[4] <= T_floor and dT_dx < 0:
+            dT_dx = 0.0
+        elif y[4] >= T_ceiling and dT_dx > 0:
+            dT_dx = 0.0
 
         # Momentum equation
         dp1_dx = -1j * omega * rho_m / (A_eff * (1 - f_nu)) * U1
@@ -764,10 +773,11 @@ class StackEnergy(Segment):
             ode_func,
             (0, self._length),
             y0,
-            method="RK45",
+            method="BDF",
             dense_output=False,
             rtol=1e-6,
             atol=1e-8,
+            max_step=max(self._length / 100.0, 1e-6),
         )
 
         if not sol.success:
