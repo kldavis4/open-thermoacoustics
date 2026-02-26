@@ -7,12 +7,12 @@ until boundary conditions at the end of the network are satisfied.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import root, OptimizeResult
+from scipy.optimize import root
 
 from openthermoacoustics.solver.network import NetworkTopology
 
@@ -431,16 +431,24 @@ class ShootingSolver:
 
         # Solve using scipy.optimize.root
         if opts["verbose"]:
-            print(f"Starting shooting method solver...")
+            print("Starting shooting method solver...")
             print(f"  Guesses: {guess_keys}")
             print(f"  Targets: {target_keys}")
+
+        root_options: dict[str, Any] = {}
+        if opts["method"] == "hybr":
+            root_options["maxfev"] = opts["maxiter"] * len(x0)
+        elif opts["method"] == "lm":
+            root_options["maxiter"] = opts["maxiter"] * len(x0)
+        else:
+            root_options["maxiter"] = opts["maxiter"] * len(x0)
 
         result = root(
             residual_func,
             x0,
             method=opts["method"],
             tol=opts["tol"],
-            options={"maxfev": opts["maxiter"] * len(x0)},
+            options=root_options,
         )
 
         # Extract final values

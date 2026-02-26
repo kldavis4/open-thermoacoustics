@@ -13,6 +13,7 @@ Policy:
 | Script | Purpose | Primary Coverage | Typical Use |
 |---|---|---|---|
 | `standing_wave_resonator.py` | standing-wave baseline | `Duct`, solver | first sanity run |
+| `standing_wave_engine.py` | standing-wave engine benchmark | `Duct`, `HeatExchanger`, `Stack`, solver | canonical engine validation |
 | `quarter_wave_resonator.py` | quarter-wave behavior | solver targets | open/closed behavior check |
 | `helmholtz_resonator.py` | lumped resonator behavior | `Compliance`, `Inertance` | low-order validation |
 | `lossy_duct_attenuation.py` | attenuation trend | `Duct`, gas/geometry effects | loss model check |

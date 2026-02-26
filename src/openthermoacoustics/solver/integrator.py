@@ -87,7 +87,10 @@ def integrate_segment(
 
     if length <= 0:
         # For zero-length segments (lumped elements), return single-point result
-        p1_out, U1_out = segment.transfer(p1_in, U1_in, T_m, omega, gas)
+        if hasattr(segment, "transfer"):
+            p1_out, U1_out = segment.transfer(p1_in, U1_in, T_m, omega, gas)
+        else:
+            p1_out, U1_out, _ = segment.propagate(p1_in, U1_in, T_m, omega, gas)
         return {
             "x": np.array([0.0]),
             "p1": np.array([p1_out]),
@@ -189,7 +192,7 @@ def _segment_has_temperature_gradient(segment: Segment) -> bool:
     if hasattr(segment, "has_temperature_gradient"):
         return bool(segment.has_temperature_gradient)
     if hasattr(segment, "dT_dx"):
-        return segment.dT_dx != 0
+        return bool(segment.dT_dx != 0)
     # Default: check segment type name as fallback
     segment_type = type(segment).__name__.lower()
     return segment_type in ("stack", "regenerator", "heatexchanger")
@@ -243,11 +246,17 @@ def _compute_derivatives(
     # Extract complex amplitudes from state
     p1, U1 = state_to_complex(y)
 
-    # Get local temperature
-    if has_temperature_gradient:
-        T_m = y[4]
+    # Get local temperature.
+    # Prefer segment-provided temperature models when available.
+    if hasattr(segment, "temperature_at") and callable(segment.temperature_at):
+        T_input = float(y[4]) if has_temperature_gradient else 300.0
+        T_m = float(segment.temperature_at(x, T_input))
+    elif hasattr(segment, "temperature"):
+        T_m = float(segment.temperature)
+    elif has_temperature_gradient:
+        T_m = float(y[4])
     else:
-        T_m = segment.T_m if hasattr(segment, "T_m") else 300.0
+        T_m = float(segment.T_m) if hasattr(segment, "T_m") else 300.0
 
     # Get gas properties at local temperature
     rho_m = gas.density(T_m)
@@ -256,7 +265,10 @@ def _compute_derivatives(
     Pr = gas.prandtl(T_m)
 
     # Get segment properties at current position
-    A = segment.area(x) if callable(getattr(segment, "area", None)) else segment.area
+    area_attr = getattr(segment, "area", None)
+    if area_attr is None:
+        raise AttributeError(f"Segment {segment!r} has no 'area' attribute")
+    A = float(area_attr(x)) if callable(area_attr) else float(area_attr)
 
     # Get thermoviscous functions from segment
     f_nu, f_kappa = _get_thermoviscous_functions(segment, x, omega, gas, T_m)
@@ -337,12 +349,20 @@ def _get_thermoviscous_functions(
             kappa = gas.thermal_conductivity(T_m)
             cp = gas.specific_heat_cp(T_m)
 
-            delta_nu = np.sqrt(2 * mu / (rho * omega))
-            delta_kappa = np.sqrt(2 * kappa / (rho * cp * omega))
+            omega_mag = max(abs(float(omega)), 1e-12)
+            delta_nu = np.sqrt(2 * mu / (rho * omega_mag))
+            delta_kappa = np.sqrt(2 * kappa / (rho * cp * omega_mag))
 
-            f_nu = geometry.f_nu(delta_nu)
-            f_kappa = geometry.f_kappa(delta_kappa)
-            return f_nu, f_kappa
+            if not hasattr(segment, "hydraulic_radius"):
+                return 0j, 0j
+            hydraulic_radius = float(getattr(segment, "hydraulic_radius"))
+
+            # Geometry API in this repo expects:
+            #   f_nu(omega, delta_nu, hydraulic_radius)
+            #   f_kappa(omega, delta_kappa, hydraulic_radius)
+            f_nu = geometry.f_nu(omega_mag, delta_nu, hydraulic_radius)
+            f_kappa = geometry.f_kappa(omega_mag, delta_kappa, hydraulic_radius)
+            return complex(f_nu), complex(f_kappa)
 
     # Try segment's own thermoviscous function methods
     if hasattr(segment, "f_nu") and hasattr(segment, "f_kappa"):
@@ -378,7 +398,9 @@ def _get_temperature_gradient(segment: Segment, x: float) -> float:
     if hasattr(segment, "T_hot") and hasattr(segment, "T_cold"):
         # Linear temperature gradient
         if segment.length > 0:
-            return (segment.T_hot - segment.T_cold) / segment.length
+            t_hot = float(segment.T_hot) if segment.T_hot is not None else 0.0
+            t_cold = float(segment.T_cold) if segment.T_cold is not None else 0.0
+            return (t_hot - t_cold) / segment.length
         return 0.0
 
     return 0.0

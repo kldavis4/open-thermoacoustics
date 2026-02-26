@@ -60,4 +60,5 @@ When a validation fails:
 
 Use these docs together:
 - [Example Matrix](./example-matrix.md)
+- [Standing-Wave Engine](./standing_wave_engine.md)
 - [Reference Mapping](../reference-mapping.md)
