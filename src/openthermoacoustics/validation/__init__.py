@@ -28,11 +28,16 @@ from openthermoacoustics.validation.traveling_wave_engine import (
     estimate_loop_frequency_range,
     find_best_frequency_by_residual,
     find_onset_ratio_proxy,
+    solve_traveling_wave_engine_complex_frequency,
     solve_traveling_wave_engine_fixed_frequency,
     sweep_efficiency_estimate,
+    sweep_traveling_wave_complex_frequency,
     sweep_traveling_wave_frequency,
     sweep_traveling_wave_temperature,
     tuned_traveling_wave_engine_candidate_config,
+)
+from openthermoacoustics.validation.traveling_wave_engine import (
+    detect_onset_from_complex_frequency as detect_tw_onset_from_complex_frequency,
 )
 
 __all__ = [
@@ -57,10 +62,13 @@ __all__ = [
     "tuned_traveling_wave_engine_candidate_config",
     "find_onset_ratio_proxy",
     "solve_traveling_wave_engine_fixed_frequency",
+    "solve_traveling_wave_engine_complex_frequency",
     "sweep_traveling_wave_frequency",
     "sweep_traveling_wave_temperature",
+    "sweep_traveling_wave_complex_frequency",
     "sweep_efficiency_estimate",
     "detect_onset_from_gain_proxy",
+    "detect_tw_onset_from_complex_frequency",
     "compute_regenerator_phase_profile",
     "compute_loop_power_profile",
     "compute_efficiency_estimate",

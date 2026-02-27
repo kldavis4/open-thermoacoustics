@@ -13,14 +13,20 @@ The current solver uses a 4x4 shooting system:
 - Unknowns: `|U1|`, `phase(U1)`, `Re(Zb)`, `Im(Zb)`
 - Targets: `Re/Im(p_mismatch at UNION)=0`, `Re/Im(U1_hardend)=0`
 
-Onset is currently reported with a tightened gain proxy, not complex-frequency
-zero crossing. This is intentional for now and documented below.
+Onset now supports both:
+
+- Gain-proxy crossing (`net_gain_proxy = 0`)
+- Complex-frequency crossing (`f_imag = 0`)
 
 ## Key Outputs
 
 Implemented in `src/openthermoacoustics/validation/traveling_wave_engine.py`:
 
 - `find_onset_ratio_proxy`: coarse+fine gain-proxy onset ratio
+- `solve_traveling_wave_engine_complex_frequency`: complex-frequency solve
+- `sweep_traveling_wave_complex_frequency`: temperature continuation sweep
+- `detect_onset_from_complex_frequency`: onset ratio from `f_imag` crossing
+  (with configurable deadband tolerance for numerical noise)
 - `compute_regenerator_phase_profile`: inlet/mid/outlet phase diagnostics
 - `compute_loop_power_profile`: boundary acoustic powers by segment
 - `compute_efficiency_estimate`: first-order efficiency estimate with Carnot bound
@@ -42,6 +48,15 @@ Observed (proxy method):
 - Regenerator phase at `T_hot=600 K`: approximately `-104°` (inlet),
   `-96°` (mid), `-93°` (outlet)
 - Net gain proxy at `600 K`: positive
+
+Complex-frequency formulation details:
+
+- Unknowns per temperature point: `f_real`, `f_imag`, `Re(Zb)`, `Im(Zb)`
+- Targets: `Re/Im(p_mismatch)=0`, `Re/Im(U1_hardend)=0`
+- Gauge/closure: `U1_input` is fixed from the converged real-frequency loop
+  solution at the same temperature.
+- Continuation: sweep in `T_hot`, seeding each point from previous
+  `(f_real, f_imag, Zb)` plus a refreshed real-frequency reference.
 
 Interpretation:
 
@@ -78,5 +93,6 @@ comparisons are qualitative/dimensionless.
 
 - Distributed-loop plumbing is complete and tested.
 - Power/phase/efficiency diagnostics are in place for optimization loops.
-- Next milestone: add true complex-frequency loop onset (`f_imag` zero crossing)
-  to replace gain-proxy onset as the primary criterion.
+- Next milestone: remove the fixed-`U1_input` gauge by promoting a fully coupled
+  augmented formulation (frequency + state + impedance) with an explicit
+  normalization constraint.

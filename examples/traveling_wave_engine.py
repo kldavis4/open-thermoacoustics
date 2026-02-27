@@ -12,12 +12,15 @@ from openthermoacoustics.validation.traveling_wave_engine import (
     compute_efficiency_estimate,
     compute_regenerator_phase_profile,
     default_traveling_wave_engine_config,
+    detect_onset_from_complex_frequency,
     detect_onset_from_gain_proxy,
     estimate_loop_frequency_range,
     find_best_frequency_by_residual,
     find_onset_ratio_proxy,
+    solve_traveling_wave_engine_complex_frequency,
     solve_traveling_wave_engine_fixed_frequency,
     sweep_efficiency_estimate,
+    sweep_traveling_wave_complex_frequency,
     sweep_traveling_wave_frequency,
     sweep_traveling_wave_temperature,
     tuned_traveling_wave_engine_candidate_config,
@@ -123,6 +126,31 @@ def main() -> None:
         frequency_hz=120.0,
         t_hot_values=np.arange(350.0, 801.0, 50.0),
     )
+    complex_sweep = sweep_traveling_wave_complex_frequency(
+        tuned,
+        t_hot_values=np.arange(350.0, 801.0, 50.0),
+        f_real_guess=120.0,
+        f_imag_guess=0.0,
+    )
+    onset_complex = detect_onset_from_complex_frequency(complex_sweep)
+    if onset_complex is None:
+        print("  Complex-frequency onset crossing not found in scanned range.")
+    else:
+        print(
+            f"  Complex-frequency onset ratio ~ {onset_complex:.3f} "
+            f"(T_hot ~ {onset_complex * tuned.t_cold:.1f} K)"
+        )
+    point_complex = solve_traveling_wave_engine_complex_frequency(
+        tuned,
+        t_hot=600.0,
+        f_real_guess=120.0,
+        f_imag_guess=0.0,
+    )
+    print(
+        "  Complex-frequency @600 K: "
+        f"f={point_complex['frequency_real']:.2f}+j{point_complex['frequency_imag']:.2f} Hz, "
+        f"residual={point_complex['residual_norm']:.3e}"
+    )
 
     output_dir = Path("examples/output")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -163,11 +191,21 @@ def main() -> None:
         save_path=output_dir / "tw_efficiency_vs_temp.png",
         show=False,
     )
+    viz.plot_frequency_sweep(
+        frequencies=[float(p["t_hot"]) for p in complex_sweep],
+        values=[float(p["frequency_imag"]) for p in complex_sweep],
+        xlabel="T_hot (K)",
+        ylabel="Imaginary Frequency (Hz)",
+        title="Traveling-Wave Complex-Frequency Growth Rate",
+        save_path=output_dir / "tw_complex_frequency_imag_vs_temp.png",
+        show=False,
+    )
     print("\nSaved figures:")
     print("  examples/output/traveling_wave_residual_vs_frequency.png")
     print("  examples/output/traveling_wave_regenerator_phase_vs_frequency.png")
     print("  examples/output/tw_onset_sweep.png")
     print("  examples/output/tw_efficiency_vs_temp.png")
+    print("  examples/output/tw_complex_frequency_imag_vs_temp.png")
 
 
 if __name__ == "__main__":

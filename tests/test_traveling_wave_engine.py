@@ -9,12 +9,15 @@ from openthermoacoustics.validation.traveling_wave_engine import (
     compute_loop_power_profile,
     compute_regenerator_phase_profile,
     default_traveling_wave_engine_config,
+    detect_onset_from_complex_frequency,
     detect_onset_from_gain_proxy,
     estimate_loop_frequency_range,
     find_best_frequency_by_residual,
     find_onset_ratio_proxy,
+    solve_traveling_wave_engine_complex_frequency,
     solve_traveling_wave_engine_fixed_frequency,
     sweep_efficiency_estimate,
+    sweep_traveling_wave_complex_frequency,
     sweep_traveling_wave_frequency,
     sweep_traveling_wave_temperature,
     tuned_traveling_wave_engine_candidate_config,
@@ -165,3 +168,36 @@ def test_efficiency_sweep_rows_are_finite() -> None:
         assert np.isfinite(row["eta_relative"])
         assert 0.0 <= row["eta_thermal_est"] <= row["eta_carnot"]
         assert 0.0 <= row["eta_relative"] <= 1.0
+
+
+def test_complex_frequency_single_point_is_finite() -> None:
+    """Complex-frequency closure should return finite values at a point."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point = solve_traveling_wave_engine_complex_frequency(
+        cfg,
+        t_hot=500.0,
+        f_real_guess=120.0,
+        f_imag_guess=0.0,
+    )
+    assert point["converged"]
+    assert np.isfinite(point["residual_norm"])
+    assert np.isfinite(point["frequency_real"])
+    assert np.isfinite(point["frequency_imag"])
+
+
+def test_complex_frequency_sweep_supports_onset_detection_api() -> None:
+    """Complex-frequency sweep should provide a valid crossing API surface."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    sweep = sweep_traveling_wave_complex_frequency(
+        cfg,
+        t_hot_values=np.array([350.0, 450.0, 550.0]),
+        f_real_guess=120.0,
+        f_imag_guess=0.0,
+    )
+    assert len(sweep) == 3
+    for point in sweep:
+        assert point["converged"]
+        assert np.isfinite(point["frequency_real"])
+        assert np.isfinite(point["frequency_imag"])
+    onset = detect_onset_from_complex_frequency(sweep)
+    assert onset is None or onset > 1.0

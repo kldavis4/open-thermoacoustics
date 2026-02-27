@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from scipy.optimize import root
 
 from openthermoacoustics import gas, segments
 from openthermoacoustics.geometry import WireScreen
@@ -417,6 +418,262 @@ def detect_onset_from_gain_proxy(
                 return t1 / t_cold
             t_cross = t0 + (t1 - t0) * ((0.0 - g0) / (g1 - g0))
             return float(t_cross / t_cold)
+    return None
+
+
+def solve_traveling_wave_engine_complex_frequency(
+    config: TravelingWaveEngineConfig,
+    *,
+    t_hot: float,
+    f_real_guess: float,
+    f_imag_guess: float = 0.0,
+    u1_input: complex | None = None,
+    zb_real_guess: float | None = None,
+    zb_imag_guess: float | None = None,
+    tol: float | None = None,
+    maxiter: int | None = None,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """
+    Solve loop closure for complex frequency with fixed input velocity.
+
+    Unknowns are `[f_real, f_imag, Re(Zb), Im(Zb)]` and targets are:
+    `Re/Im(p_mismatch)=0`, `Re/Im(U1_hardend)=0`.
+
+    Notes
+    -----
+    The loop topology needs one gauge choice to close the system when frequency
+    is unknown. We use the input velocity from a converged real-frequency solve
+    as that gauge and then solve for complex frequency and loop impedance.
+    """
+    real_reference = None
+    if u1_input is None:
+        real_reference = solve_traveling_wave_engine_fixed_frequency(
+            config,
+            frequency_hz=f_real_guess,
+            t_hot=t_hot,
+            zb_real_guess=zb_real_guess,
+            zb_imag_guess=zb_imag_guess,
+            verbose=False,
+        )
+        ref_result: TBranchLoopResult = real_reference["result"]
+        u1_input = ref_result.U1_input
+        if zb_real_guess is None:
+            zb_real_guess = ref_result.Zb_real
+        if zb_imag_guess is None:
+            zb_imag_guess = ref_result.Zb_imag
+
+    if zb_real_guess is None:
+        zb_real_guess = config.zb_real_guess
+    if zb_imag_guess is None:
+        zb_imag_guess = config.zb_imag_guess
+
+    helium = gas.Helium(mean_pressure=config.mean_pressure)
+    trunk_segments, branch_segments = build_traveling_wave_paths(config, t_hot=t_hot)
+    propagator = DistributedLoopPropagator(
+        trunk_segments=trunk_segments,
+        branch_segments=branch_segments,
+        gas=helium,
+        omega=2.0 * np.pi * (f_real_guess + 1j * f_imag_guess),
+        t_m_start=config.t_m_start,
+        n_points_per_segment=config.n_points_per_segment,
+    )
+
+    freq_scale = max(abs(f_real_guess), 1.0)
+    imag_scale = max(abs(f_imag_guess), 1.0)
+    z_scale = max(abs(zb_real_guess), abs(zb_imag_guess), 1e3)
+    u_scale = max(abs(u1_input), 1e-9)
+
+    def residual(x: np.ndarray) -> np.ndarray:
+        f_real = x[0] * freq_scale
+        f_imag = x[1] * imag_scale
+        zb_real = x[2] * z_scale
+        zb_imag = x[3] * z_scale
+        omega = 2.0 * np.pi * (f_real + 1j * f_imag)
+        propagator.omega = omega
+        try:
+            _p1_union, u1_hardend, p_mismatch = propagator(
+                config.p1_input,
+                u1_input,
+                complex(zb_real, zb_imag),
+            )
+        except Exception:
+            return np.array([1e8, 1e8, 1e8, 1e8], dtype=float)
+
+        return np.array(
+            [
+                p_mismatch.real / 1000.0,
+                p_mismatch.imag / 1000.0,
+                u1_hardend.real / u_scale,
+                u1_hardend.imag / u_scale,
+            ],
+            dtype=float,
+        )
+
+    x0 = np.array(
+        [
+            f_real_guess / freq_scale,
+            f_imag_guess / imag_scale,
+            zb_real_guess / z_scale,
+            zb_imag_guess / z_scale,
+        ],
+        dtype=float,
+    )
+    tol_local = config.tol if tol is None else tol
+    maxiter_local = config.maxiter if maxiter is None else maxiter
+
+    result = root(
+        residual,
+        x0,
+        method="hybr",
+        tol=tol_local,
+        options={"maxfev": maxiter_local * 20},
+    )
+    if not result.success:
+        result = root(
+            residual,
+            x0,
+            method="lm",
+            tol=tol_local,
+            options={"maxiter": maxiter_local * 20},
+        )
+
+    f_real = float(result.x[0] * freq_scale)
+    f_imag = float(result.x[1] * imag_scale)
+    zb_real = float(result.x[2] * z_scale)
+    zb_imag = float(result.x[3] * z_scale)
+    omega = 2.0 * np.pi * (f_real + 1j * f_imag)
+    propagator.omega = omega
+
+    p1_union, u1_hardend, p_mismatch = propagator(
+        config.p1_input,
+        u1_input,
+        complex(zb_real, zb_imag),
+    )
+    profiles = propagator.latest_profiles()
+    branch_deltas = _section_power_deltas(profiles["branch"])
+    trunk_deltas = _section_power_deltas(profiles["trunk"])
+    regen_delta, net_gain_proxy = _gain_proxy(branch_deltas, trunk_deltas)
+    phase_mid = _phase_at_regenerator_midpoint(profiles["branch"])
+
+    if verbose:
+        print(
+            "complex solve: "
+            f"T_hot={t_hot:.1f} K, "
+            f"f={f_real:.3f}+j{f_imag:.3f} Hz, "
+            f"residual={np.linalg.norm(result.fun):.3e}"
+        )
+
+    return {
+        "converged": bool(result.success),
+        "message": str(result.message),
+        "n_iterations": int(getattr(result, "nfev", 0)),
+        "residual_norm": float(np.linalg.norm(result.fun)),
+        "frequency_real": f_real,
+        "frequency_imag": f_imag,
+        "omega": omega,
+        "zb_real": zb_real,
+        "zb_imag": zb_imag,
+        "zb": complex(zb_real, zb_imag),
+        "p1_input": config.p1_input,
+        "u1_input": u1_input,
+        "p1_union": p1_union,
+        "u1_hardend": u1_hardend,
+        "pressure_mismatch": p_mismatch,
+        "profiles": profiles,
+        "branch_power_deltas": branch_deltas,
+        "trunk_power_deltas": trunk_deltas,
+        "regenerator_power_delta": regen_delta,
+        "net_gain_proxy": net_gain_proxy,
+        "phase_regenerator_mid_deg": phase_mid,
+        "branch_power_profile": _section_boundary_power(profiles["branch"]),
+        "trunk_power_profile": _section_boundary_power(profiles["trunk"]),
+        "temperature_ratio": float(t_hot / config.t_cold),
+        "t_hot": float(t_hot),
+        "u1_reference_from_real": real_reference,
+    }
+
+
+def sweep_traveling_wave_complex_frequency(
+    config: TravelingWaveEngineConfig,
+    *,
+    t_hot_values: np.ndarray,
+    f_real_guess: float,
+    f_imag_guess: float = 0.0,
+) -> list[dict[str, Any]]:
+    """
+    Sweep hot temperature using complex-frequency solve with continuation.
+
+    Continuation strategy:
+    1. At each temperature, solve the real-frequency loop first to refresh the
+       velocity-reference gauge (`U1_input`).
+    2. Solve complex frequency using previous `(f_real, f_imag, Zb)` as seeds.
+    """
+    points: list[dict[str, Any]] = []
+
+    f_real = f_real_guess
+    f_imag = f_imag_guess
+    u1_mag = config.u1_mag_guess
+    u1_phase = config.u1_phase_guess
+    zb_real = config.zb_real_guess
+    zb_imag = config.zb_imag_guess
+
+    for t_hot in t_hot_values:
+        real_point = solve_traveling_wave_engine_fixed_frequency(
+            config,
+            frequency_hz=float(f_real),
+            t_hot=float(t_hot),
+            u1_mag_guess=u1_mag,
+            u1_phase_guess=u1_phase,
+            zb_real_guess=zb_real,
+            zb_imag_guess=zb_imag,
+            verbose=False,
+        )
+        real_result: TBranchLoopResult = real_point["result"]
+        u1_mag = real_result.U1_magnitude
+        u1_phase = real_result.U1_phase
+
+        point = solve_traveling_wave_engine_complex_frequency(
+            config,
+            t_hot=float(t_hot),
+            f_real_guess=float(f_real),
+            f_imag_guess=float(f_imag),
+            u1_input=real_result.U1_input,
+            zb_real_guess=real_result.Zb_real,
+            zb_imag_guess=real_result.Zb_imag,
+            verbose=False,
+        )
+        point["real_frequency_reference"] = real_point
+        points.append(point)
+
+        f_real = float(point["frequency_real"])
+        f_imag = float(point["frequency_imag"])
+        zb_real = float(point["zb_real"])
+        zb_imag = float(point["zb_imag"])
+
+    return points
+
+
+def detect_onset_from_complex_frequency(
+    sweep: list[dict[str, Any]],
+    *,
+    f_imag_tol_hz: float = 1e-4,
+) -> float | None:
+    """
+    Detect onset ratio from `f_imag` sign crossing.
+
+    Convention used: onset is where `f_imag` crosses from positive (damped) to
+    non-positive (growing).
+    """
+    for i in range(len(sweep) - 1):
+        fi0 = float(sweep[i]["frequency_imag"])
+        fi1 = float(sweep[i + 1]["frequency_imag"])
+        if fi0 > f_imag_tol_hz and fi1 < -f_imag_tol_hz:
+            r0 = float(sweep[i]["temperature_ratio"])
+            r1 = float(sweep[i + 1]["temperature_ratio"])
+            if abs(fi1 - fi0) < 1e-15:
+                return r1
+            return r0 + (r1 - r0) * (fi0 / (fi0 - fi1))
     return None
 
 
