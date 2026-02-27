@@ -269,6 +269,8 @@ def _compute_derivatives(
     if area_attr is None:
         raise AttributeError(f"Segment {segment!r} has no 'area' attribute")
     A = float(area_attr(x)) if callable(area_attr) else float(area_attr)
+    if hasattr(segment, "porosity"):
+        A *= float(getattr(segment, "porosity"))
 
     # Get thermoviscous functions from segment
     f_nu, f_kappa = _get_thermoviscous_functions(segment, x, omega, gas, T_m)
@@ -349,7 +351,7 @@ def _get_thermoviscous_functions(
             kappa = gas.thermal_conductivity(T_m)
             cp = gas.specific_heat_cp(T_m)
 
-            omega_mag = max(abs(float(omega)), 1e-12)
+            omega_mag = max(abs(omega), 1e-12)
             delta_nu = np.sqrt(2 * mu / (rho * omega_mag))
             delta_kappa = np.sqrt(2 * kappa / (rho * cp * omega_mag))
 

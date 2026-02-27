@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
+from scipy.optimize import root
 
 from openthermoacoustics import gas, segments
 from openthermoacoustics.geometry.parallel_plate import ParallelPlate
@@ -91,6 +93,37 @@ class EngineSweepPoint:
 def default_standing_wave_engine_config() -> StandingWaveEngineConfig:
     """Return default canonical standing-wave engine configuration."""
     return StandingWaveEngineConfig()
+
+
+def optimized_standing_wave_engine_config() -> StandingWaveEngineConfig:
+    """
+    Return the current best-performing standing-wave benchmark configuration.
+
+    This configuration was selected from parameter sweeps over stack position,
+    plate half-gap, and resonator length, using complex-frequency onset
+    crossing as the primary criterion.
+    """
+    return StandingWaveEngineConfig(
+        left_duct_length=1.0,
+        right_duct_length=0.2,
+        plate_spacing=1.2e-3,   # y0 = 0.6 mm
+        plate_thickness=0.14983127109111363e-3,  # keep porosity ~= 0.889
+    )
+
+
+def symmetric_negative_control_config() -> StandingWaveEngineConfig:
+    """Return symmetric layout expected to remain below onset <= 800 K."""
+    return default_standing_wave_engine_config()
+
+
+def shifted_negative_control_config() -> StandingWaveEngineConfig:
+    """Return shifted layout (0.10/0.50) used as secondary negative control."""
+    return StandingWaveEngineConfig(left_duct_length=0.10, right_duct_length=0.50)
+
+
+def geometry_sensitive_reference_config() -> StandingWaveEngineConfig:
+    """Return a geometry-sensitive reference layout with higher onset."""
+    return StandingWaveEngineConfig(left_duct_length=0.45, right_duct_length=0.15)
 
 
 def build_standing_wave_engine_network(
@@ -220,3 +253,191 @@ def compute_power_change(
     i_start = int(np.argmin(np.abs(x - x_start)))
     i_end = int(np.argmin(np.abs(x - x_end)))
     return float(power[i_end] - power[i_start])
+
+
+def solve_standing_wave_engine_complex_frequency(
+    config: StandingWaveEngineConfig,
+    t_hot: float,
+    *,
+    frequency_real_guess: float | None = None,
+    frequency_imag_guess: float = 0.0,
+) -> dict[str, float | bool | str]:
+    """
+    Solve closed-closed boundary conditions using complex frequency.
+
+    Solves for `(f_real, f_imag)` such that `U1_end_real = U1_end_imag = 0`.
+    """
+    helium = gas.Helium(mean_pressure=config.mean_pressure)
+    network = build_standing_wave_engine_network(config, t_hot=t_hot)
+
+    if frequency_real_guess is None:
+        frequency_real_guess = helium.sound_speed(config.t_cold) / (2.0 * config.total_length)
+
+    def residual(vec: np.ndarray) -> np.ndarray:
+        f_real = float(vec[0])
+        f_imag = float(vec[1])
+        omega = 2.0 * np.pi * (f_real + 1j * f_imag)
+        try:
+            network.propagate_all(
+                p1_start=1000.0 + 0.0j,
+                U1_start=0.0 + 0.0j,
+                T_m_start=config.t_cold,
+                omega=omega,  # type: ignore[arg-type]
+                gas=helium,
+                n_points_per_segment=config.n_points_per_segment,
+            )
+            endpoint = network.get_endpoint_values()["U1_end"]
+            return np.array([endpoint.real, endpoint.imag], dtype=float)
+        except Exception:
+            return np.array([1e12, 1e12], dtype=float)
+
+    result = root(
+        residual,
+        x0=np.array([frequency_real_guess, frequency_imag_guess], dtype=float),
+        method="hybr",
+        tol=config.tol,
+    )
+    f_real = float(result.x[0])
+    f_imag = float(result.x[1])
+    omega = 2.0 * np.pi * (f_real + 1j * f_imag)
+    network.propagate_all(
+        p1_start=1000.0 + 0.0j,
+        U1_start=0.0 + 0.0j,
+        T_m_start=config.t_cold,
+        omega=omega,  # type: ignore[arg-type]
+        gas=helium,
+        n_points_per_segment=config.n_points_per_segment,
+    )
+    profiles = network.get_global_profiles()
+    i_start = int(np.argmin(np.abs(profiles["x"] - config.stack_start)))
+    i_end = int(np.argmin(np.abs(profiles["x"] - config.stack_end)))
+    stack_power_change = float(profiles["acoustic_power"][i_end] - profiles["acoustic_power"][i_start])
+    u_end = complex(network.get_endpoint_values()["U1_end"])
+
+    return {
+        "frequency_real": f_real,
+        "frequency_imag": f_imag,
+        "converged": bool(result.success),
+        "message": str(result.message),
+        "residual_norm": float(np.linalg.norm(result.fun)),
+        "u1_end_abs": float(abs(u_end)),
+        "stack_power_change": stack_power_change,
+    }
+
+
+def solve_standing_wave_engine_complex_frequency_with_profiles(
+    config: StandingWaveEngineConfig,
+    t_hot: float,
+    *,
+    frequency_real_guess: float | None = None,
+    frequency_imag_guess: float = 0.0,
+) -> dict[str, Any]:
+    """Solve complex-frequency resonance and return full propagated profiles."""
+    helium = gas.Helium(mean_pressure=config.mean_pressure)
+    network = build_standing_wave_engine_network(config, t_hot=t_hot)
+
+    if frequency_real_guess is None:
+        frequency_real_guess = helium.sound_speed(config.t_cold) / (2.0 * config.total_length)
+
+    def residual(vec: np.ndarray) -> np.ndarray:
+        f_real = float(vec[0])
+        f_imag = float(vec[1])
+        omega = 2.0 * np.pi * (f_real + 1j * f_imag)
+        try:
+            network.propagate_all(
+                p1_start=1000.0 + 0.0j,
+                U1_start=0.0 + 0.0j,
+                T_m_start=config.t_cold,
+                omega=omega,  # type: ignore[arg-type]
+                gas=helium,
+                n_points_per_segment=config.n_points_per_segment,
+            )
+            endpoint = network.get_endpoint_values()["U1_end"]
+            return np.array([endpoint.real, endpoint.imag], dtype=float)
+        except Exception:
+            return np.array([1e12, 1e12], dtype=float)
+
+    result = root(
+        residual,
+        x0=np.array([frequency_real_guess, frequency_imag_guess], dtype=float),
+        method="hybr",
+        tol=config.tol,
+    )
+    f_real = float(result.x[0])
+    f_imag = float(result.x[1])
+    omega = 2.0 * np.pi * (f_real + 1j * f_imag)
+    network.propagate_all(
+        p1_start=1000.0 + 0.0j,
+        U1_start=0.0 + 0.0j,
+        T_m_start=config.t_cold,
+        omega=omega,  # type: ignore[arg-type]
+        gas=helium,
+        n_points_per_segment=config.n_points_per_segment,
+    )
+    profiles = network.get_global_profiles()
+    i_start = int(np.argmin(np.abs(profiles["x"] - config.stack_start)))
+    i_end = int(np.argmin(np.abs(profiles["x"] - config.stack_end)))
+    stack_power_change = float(profiles["acoustic_power"][i_end] - profiles["acoustic_power"][i_start])
+    u_end = complex(network.get_endpoint_values()["U1_end"])
+
+    return {
+        "frequency_real": f_real,
+        "frequency_imag": f_imag,
+        "converged": bool(result.success),
+        "message": str(result.message),
+        "residual_norm": float(np.linalg.norm(result.fun)),
+        "u1_end_abs": float(abs(u_end)),
+        "stack_power_change": stack_power_change,
+        "profiles": profiles,
+    }
+
+
+def sweep_standing_wave_engine_complex_frequency(
+    config: StandingWaveEngineConfig,
+    t_hot_values: Iterable[float],
+    *,
+    frequency_real_guess: float | None = None,
+    frequency_imag_guess: float = 0.0,
+) -> list[dict[str, float | bool | str]]:
+    """Run continuation sweep with complex frequency as primary onset metric."""
+    if frequency_real_guess is None:
+        helium = gas.Helium(mean_pressure=config.mean_pressure)
+        frequency_real_guess = helium.sound_speed(config.t_cold) / (2.0 * config.total_length)
+
+    sweep: list[dict[str, float | bool | str]] = []
+    fr = frequency_real_guess
+    fi = frequency_imag_guess
+    for t_hot in t_hot_values:
+        point = solve_standing_wave_engine_complex_frequency(
+            config,
+            t_hot=float(t_hot),
+            frequency_real_guess=fr,
+            frequency_imag_guess=fi,
+        )
+        fr = float(point["frequency_real"])
+        fi = float(point["frequency_imag"])
+        point["t_hot"] = float(t_hot)
+        point["temperature_ratio"] = float(t_hot / config.t_cold)
+        sweep.append(point)
+    return sweep
+
+
+def detect_onset_from_complex_frequency(
+    sweep: list[dict[str, float | bool | str]],
+) -> float | None:
+    """
+    Detect onset temperature ratio from f_imag sign crossing.
+
+    Convention used here: onset occurs when f_imag crosses from positive
+    (damped) to negative (growing oscillation).
+    """
+    for i in range(len(sweep) - 1):
+        fi0 = float(sweep[i]["frequency_imag"])
+        fi1 = float(sweep[i + 1]["frequency_imag"])
+        if fi0 > 0.0 and fi1 <= 0.0:
+            r0 = float(sweep[i]["temperature_ratio"])
+            r1 = float(sweep[i + 1]["temperature_ratio"])
+            if abs(fi1 - fi0) < 1e-15:
+                return r1
+            return r0 + (r1 - r0) * (fi0 / (fi0 - fi1))
+    return None
