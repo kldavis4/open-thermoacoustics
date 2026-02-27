@@ -17,6 +17,17 @@ from openthermoacoustics.validation.standing_wave_engine import (
     sweep_standing_wave_engine_complex_frequency,
     symmetric_negative_control_config,
 )
+from openthermoacoustics.validation.traveling_wave_engine import (
+    TravelingWaveEngineConfig,
+    build_traveling_wave_paths,
+    default_traveling_wave_engine_config,
+    detect_onset_from_gain_proxy,
+    find_best_frequency_by_residual,
+    solve_traveling_wave_engine_fixed_frequency,
+    sweep_traveling_wave_frequency,
+    sweep_traveling_wave_temperature,
+    tuned_traveling_wave_engine_candidate_config,
+)
 
 __all__ = [
     "EngineSweepPoint",
@@ -34,4 +45,13 @@ __all__ = [
     "solve_standing_wave_engine_complex_frequency_with_profiles",
     "sweep_standing_wave_engine_complex_frequency",
     "sweep_standing_wave_engine",
+    "TravelingWaveEngineConfig",
+    "build_traveling_wave_paths",
+    "default_traveling_wave_engine_config",
+    "tuned_traveling_wave_engine_candidate_config",
+    "solve_traveling_wave_engine_fixed_frequency",
+    "sweep_traveling_wave_frequency",
+    "sweep_traveling_wave_temperature",
+    "detect_onset_from_gain_proxy",
+    "find_best_frequency_by_residual",
 ]
