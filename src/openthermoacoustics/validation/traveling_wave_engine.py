@@ -206,6 +206,28 @@ def _section_power_deltas(chain_result: Any) -> dict[str, float]:
     return deltas
 
 
+def _section_boundary_power(chain_result: Any) -> list[dict[str, float | str]]:
+    """Return absolute boundary powers for each section."""
+    if chain_result is None:
+        return []
+    rows: list[dict[str, float | str]] = []
+    for section in chain_result.sections:
+        if len(section.acoustic_power) == 0:
+            continue
+        label = section.segment_name or section.segment_type
+        rows.append(
+            {
+                "segment": label,
+                "x_start": float(section.x_start),
+                "x_end": float(section.x_end),
+                "w_in": float(section.acoustic_power[0]),
+                "w_out": float(section.acoustic_power[-1]),
+                "delta_w": float(section.acoustic_power[-1] - section.acoustic_power[0]),
+            }
+        )
+    return rows
+
+
 def _gain_proxy(
     branch_deltas: dict[str, float],
     trunk_deltas: dict[str, float],
@@ -289,6 +311,8 @@ def solve_traveling_wave_engine_fixed_frequency(
         "regenerator_power_delta": regen_delta,
         "net_gain_proxy": net_gain_proxy,
         "phase_regenerator_mid_deg": phase_mid,
+        "branch_power_profile": _section_boundary_power(profiles["branch"]),
+        "trunk_power_profile": _section_boundary_power(profiles["trunk"]),
         "t_hot": float(config.t_hot if t_hot is None else t_hot),
     }
 
@@ -394,3 +418,163 @@ def detect_onset_from_gain_proxy(
             t_cross = t0 + (t1 - t0) * ((0.0 - g0) / (g1 - g0))
             return float(t_cross / t_cold)
     return None
+
+
+def find_onset_ratio_proxy(
+    config: TravelingWaveEngineConfig,
+    *,
+    frequency_hz: float,
+    t_hot_min: float = 300.0,
+    t_hot_max: float = 900.0,
+    coarse_step: float = 50.0,
+    fine_step: float = 10.0,
+) -> tuple[float | None, list[dict[str, Any]]]:
+    """
+    Compute onset ratio from gain proxy using coarse+fine temperature sweeps.
+    """
+    coarse = np.arange(t_hot_min, t_hot_max + coarse_step, coarse_step)
+    coarse_sweep = sweep_traveling_wave_temperature(
+        config,
+        frequency_hz=frequency_hz,
+        t_hot_values=coarse,
+    )
+    onset = detect_onset_from_gain_proxy(coarse_sweep, t_cold=config.t_cold)
+    if onset is None:
+        return None, coarse_sweep
+
+    # Refine around nearest coarse transition
+    crossing_idx = None
+    for i in range(len(coarse_sweep) - 1):
+        g0 = float(coarse_sweep[i]["net_gain_proxy"])
+        g1 = float(coarse_sweep[i + 1]["net_gain_proxy"])
+        if g0 <= 0.0 < g1:
+            crossing_idx = i
+            break
+    if crossing_idx is None:
+        return onset, coarse_sweep
+
+    t0 = float(coarse_sweep[crossing_idx]["t_hot"])
+    t1 = float(coarse_sweep[crossing_idx + 1]["t_hot"])
+    fine = np.arange(t0, t1 + fine_step, fine_step)
+    fine_sweep = sweep_traveling_wave_temperature(
+        config,
+        frequency_hz=frequency_hz,
+        t_hot_values=fine,
+    )
+    onset_fine = detect_onset_from_gain_proxy(fine_sweep, t_cold=config.t_cold)
+    return onset_fine, fine_sweep
+
+
+def compute_regenerator_phase_profile(point: dict[str, Any]) -> dict[str, float]:
+    """Return regenerator phase at inlet/mid/outlet in degrees."""
+    branch = point["profiles"]["branch"]
+    reg_section = None
+    for section in branch.sections:
+        if section.segment_name == "regenerator":
+            reg_section = section
+            break
+    if reg_section is None or len(reg_section.p1) < 2:
+        return {"inlet_deg": float("nan"), "mid_deg": float("nan"), "outlet_deg": float("nan")}
+
+    def phase_idx(i: int) -> float:
+        p = reg_section.p1[i]
+        u = reg_section.U1[i]
+        ph = np.degrees(np.angle(p) - np.angle(u))
+        return float((ph + 180.0) % 360.0 - 180.0)
+
+    return {
+        "inlet_deg": phase_idx(0),
+        "mid_deg": phase_idx(len(reg_section.p1) // 2),
+        "outlet_deg": phase_idx(-1),
+    }
+
+
+def compute_loop_power_profile(point: dict[str, Any]) -> dict[str, list[dict[str, float | str]]]:
+    """Return absolute boundary power profiles for branch and trunk sections."""
+    return {
+        "branch": list(point["branch_power_profile"]),
+        "trunk": list(point["trunk_power_profile"]),
+    }
+
+
+def compute_efficiency_estimate(
+    point: dict[str, Any],
+    *,
+    t_cold: float,
+    t_hot: float,
+) -> dict[str, float]:
+    """
+    Compute a first-order thermal efficiency estimate from power budgets.
+    """
+    eta_carnot = 1.0 - t_cold / t_hot
+    regen_delta = point["regenerator_power_delta"]
+    if regen_delta is None or regen_delta <= 0.0:
+        return {
+            "eta_carnot": float(eta_carnot),
+            "eta_thermal_est": 0.0,
+            "eta_relative": 0.0,
+            "w_regen": float(0.0 if regen_delta is None else regen_delta),
+            "w_useful": 0.0,
+        }
+
+    # Use resonator dissipation as delivered useful acoustic power proxy.
+    trunk_deltas = point["trunk_power_deltas"]
+    w_useful = max(0.0, -float(trunk_deltas.get("resonator", 0.0)))
+    eta_thermal_est = eta_carnot * (w_useful / float(regen_delta))
+    eta_thermal_est = max(0.0, min(float(eta_thermal_est), float(eta_carnot)))
+    eta_relative = eta_thermal_est / eta_carnot if eta_carnot > 0 else 0.0
+    return {
+        "eta_carnot": float(eta_carnot),
+        "eta_thermal_est": float(eta_thermal_est),
+        "eta_relative": float(eta_relative),
+        "w_regen": float(regen_delta),
+        "w_useful": float(w_useful),
+    }
+
+
+def sweep_efficiency_estimate(
+    config: TravelingWaveEngineConfig,
+    *,
+    frequency_hz: float,
+    t_hot_values: np.ndarray,
+) -> list[dict[str, float]]:
+    """Sweep temperatures and return efficiency-estimate diagnostics."""
+    points = sweep_traveling_wave_temperature(
+        config,
+        frequency_hz=frequency_hz,
+        t_hot_values=t_hot_values,
+    )
+    rows: list[dict[str, float]] = []
+    for point in points:
+        t_hot = float(point["t_hot"])
+        eff = compute_efficiency_estimate(point, t_cold=config.t_cold, t_hot=t_hot)
+        rows.append(
+            {
+                "t_hot": t_hot,
+                "eta_carnot": eff["eta_carnot"],
+                "eta_thermal_est": eff["eta_thermal_est"],
+                "eta_relative": eff["eta_relative"],
+                "w_regen": eff["w_regen"],
+                "w_useful": eff["w_useful"],
+                "net_gain_proxy": float(point["net_gain_proxy"]),
+            }
+        )
+    return rows
+
+
+def estimate_loop_frequency_range(config: TravelingWaveEngineConfig) -> dict[str, float]:
+    """
+    Estimate expected operating frequency from quarter-wave resonator loading.
+
+    The resonator behaves approximately like a quarter-wave section loaded by the
+    loop impedance; empirical loading often shifts the frequency downward by
+    roughly 30-50%.
+    """
+    helium = gas.Helium(mean_pressure=config.mean_pressure)
+    a = helium.sound_speed(config.t_cold)
+    quarter_wave = a / (4.0 * config.resonator_length)
+    return {
+        "f_quarter_hz": float(quarter_wave),
+        "f_expected_low_hz": float(0.5 * quarter_wave),
+        "f_expected_high_hz": float(0.7 * quarter_wave),
+    }

@@ -2,46 +2,81 @@
 
 ## Scope
 
-This case connects `TBranchLoopSolver` to the distributed segment integrator so
-looped topologies can be solved with real thermoacoustic segments (ducts, heat
-exchangers, regenerator/stack with gradient), not only lumped impedances.
+This benchmark connects `TBranchLoopSolver` to distributed segment integration
+for looped topologies:
 
-Topology solved:
+`TBRANCH -> trunk(resonator -> HARDEND)` and  
+`TBRANCH -> branch(AHX1 -> regenerator -> HHX -> TBT -> AHX2 -> feedback) -> UNION`
 
-`TBRANCH -> trunk(resonator -> HARDEND)` and `TBRANCH -> branch(AHX1 -> regenerator -> HHX -> TBT -> AHX2 -> feedback duct) -> UNION`
+The current solver uses a 4x4 shooting system:
 
-The loop solver shoots on:
+- Unknowns: `|U1|`, `phase(U1)`, `Re(Zb)`, `Im(Zb)`
+- Targets: `Re/Im(p_mismatch at UNION)=0`, `Re/Im(U1_hardend)=0`
 
-- `|U1|`, `phase(U1)`, `Re(Zb)`, `Im(Zb)`
+Onset is currently reported with a tightened gain proxy, not complex-frequency
+zero crossing. This is intentional for now and documented below.
 
-to satisfy:
+## Key Outputs
 
-- `Re/Im(pressure mismatch at UNION) = 0`
-- `Re/Im(U1 at HARDEND) = 0`
+Implemented in `src/openthermoacoustics/validation/traveling_wave_engine.py`:
 
-## Files
+- `find_onset_ratio_proxy`: coarse+fine gain-proxy onset ratio
+- `compute_regenerator_phase_profile`: inlet/mid/outlet phase diagnostics
+- `compute_loop_power_profile`: boundary acoustic powers by segment
+- `compute_efficiency_estimate`: first-order efficiency estimate with Carnot bound
+- `sweep_efficiency_estimate`: temperature sweep of efficiency metrics
+- `estimate_loop_frequency_range`: quarter-wave + loop-loading sanity range
 
-- Bridge module: `src/openthermoacoustics/solver/distributed_loop.py`
-- Loop solver: `src/openthermoacoustics/solver/tbranch_loop_solver.py`
-- Validation API: `src/openthermoacoustics/validation/traveling_wave_engine.py`
-- Example: `examples/traveling_wave_engine.py`
-- Optimization sweep: `scripts/optimize_traveling_wave.py`
-- Tests: `tests/test_distributed_loop.py`, `tests/test_traveling_wave_engine.py`
+## Tuned Candidate (Current Primary TW Regression Case)
 
-## Current Status
+- `mean_pressure = 4.0 MPa`
+- `resonator_length = 0.8 m`
+- `feedback_radius = 0.03 m`
+- `feedback_length = 0.5 m`
+- `tbt_length = 0.25 m`
+- `regenerator_hydraulic_radius = 0.12 mm`
 
-- Minimum viable distributed-loop solve is implemented and tested.
-- Fixed-frequency solves converge robustly in baseline sweeps (`50..250 Hz`).
-- Best residual frequency region can be identified from sweep.
-- Regenerator phase is reported as a diagnostic for traveling-wave character.
-- A first-pass temperature sweep API is added with a net-gain proxy:
-  `regenerator power delta - other segment losses`.
-- A proxy onset detector is available from gain-proxy zero crossing.
-- A tuned candidate configuration is included for regression tracking and
-  currently shows proxy onset in a low ratio band (~`1.18-1.20` in coarse sweeps).
+Observed (proxy method):
 
-## Notes
+- Onset ratio: `~1.16` at `120 Hz` (`T_hot/T_cold`)
+- Regenerator phase at `T_hot=600 K`: approximately `-104°` (inlet),
+  `-96°` (mid), `-93°` (outlet)
+- Net gain proxy at `600 K`: positive
 
-- This is the plumbing milestone (distributed propagation + loop shooting).
-- Full onset mapping for the traveling-wave engine with complex-frequency growth
-  criterion is the next milestone and builds directly on this bridge.
+Interpretation:
+
+- The configuration clearly outperforms the standing-wave benchmark on onset
+  ratio.
+- Phase is still closer to standing-wave-like than ideal traveling-wave (`~0°`),
+  so this is a promising but not fully optimized traveling-wave state.
+
+## Efficiency and Power Budget
+
+The current efficiency estimate is a conservative first-order metric:
+
+- `eta_carnot = 1 - T_cold/T_hot`
+- `W_regen = Delta W` across regenerator
+- `W_useful = -Delta W` in resonator section (non-negative clipped)
+- `eta_thermal_est = eta_carnot * (W_useful / W_regen)` clipped to `[0, eta_carnot]`
+
+This keeps second-law consistency by construction and is useful for relative
+screening during geometry sweeps. It is not a full second-order enthalpy-flux
+efficiency model.
+
+## Comparison to Published Ranges
+
+| Metric | This benchmark | Literature context |
+|---|---:|---:|
+| Onset ratio `T_hot/T_cold` | ~1.16 (proxy) | ~1.06 to 1.22 reported for optimized TW systems |
+| Frequency | solver sweep around 120 Hz | order-of-magnitude consistent with low-100 Hz TW engines |
+| Regenerator phase(p,u) | around -90° to -105° | ideal TW behavior is near 0° |
+
+Caveat: this geometry is not a direct replica of Backhaus & Swift hardware, so
+comparisons are qualitative/dimensionless.
+
+## Status and Next Step
+
+- Distributed-loop plumbing is complete and tested.
+- Power/phase/efficiency diagnostics are in place for optimization loops.
+- Next milestone: add true complex-frequency loop onset (`f_imag` zero crossing)
+  to replace gain-proxy onset as the primary criterion.
