@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from scipy.optimize import root
+from scipy.optimize import least_squares, root
 
 from openthermoacoustics import gas, segments
 from openthermoacoustics.geometry import WireScreen
@@ -256,6 +256,29 @@ def _gain_proxy(
     return float(regen_delta), float(regen_delta - losses)
 
 
+def _phase_difference_deg(a_deg: float, b_deg: float) -> float:
+    """Return wrapped phase difference |a-b| in degrees on [-180, 180]."""
+    diff = (a_deg - b_deg + 180.0) % 360.0 - 180.0
+    return float(abs(diff))
+
+
+def _dominant_power_sign(rows: list[dict[str, float | str]]) -> int | None:
+    """Infer dominant acoustic power-flow sign from boundary rows."""
+    signs: list[int] = []
+    for row in rows:
+        for key in ("w_in", "w_out"):
+            val = float(row[key])
+            if abs(val) > 1e-10:
+                signs.append(int(np.sign(val)))
+    if not signs:
+        return None
+    pos = signs.count(1)
+    neg = signs.count(-1)
+    if pos == neg:
+        return None
+    return 1 if pos > neg else -1
+
+
 def solve_traveling_wave_engine_fixed_frequency(
     config: TravelingWaveEngineConfig,
     *,
@@ -427,27 +450,31 @@ def solve_traveling_wave_engine_complex_frequency(
     t_hot: float,
     f_real_guess: float,
     f_imag_guess: float = 0.0,
-    u1_input: complex | None = None,
+    u1_mag_guess: float | None = None,
+    u1_phase_fixed_rad: float | None = None,
     zb_real_guess: float | None = None,
     zb_imag_guess: float | None = None,
+    p_norm: float | None = None,
+    f_real_span_hz: float | None = None,
     tol: float | None = None,
     maxiter: int | None = None,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """
-    Solve loop closure for complex frequency with fixed input velocity.
+    Solve 5x5 complex-frequency loop closure with amplitude normalization.
 
-    Unknowns are `[f_real, f_imag, Re(Zb), Im(Zb)]` and targets are:
-    `Re/Im(p_mismatch)=0`, `Re/Im(U1_hardend)=0`.
+    Unknowns are `[f_real, f_imag, |U1_input|, Re(Zb), Im(Zb)]` and targets are:
+    `Re/Im(p_mismatch)=0`, `Re/Im(U1_hardend)=0`, and
+    `|p1_trunk_end| - p_norm = 0`.
 
     Notes
     -----
-    The loop topology needs one gauge choice to close the system when frequency
-    is unknown. We use the input velocity from a converged real-frequency solve
-    as that gauge and then solve for complex frequency and loop impedance.
+    Phase gauge convention: `p1_input = p_norm + 0j`, and `phase(U1_input)` is
+    fixed from a converged real-frequency reference solve at the same
+    temperature. The 5th residual pins amplitude scale at trunk-end pressure.
     """
     real_reference = None
-    if u1_input is None:
+    if u1_phase_fixed_rad is None or u1_mag_guess is None:
         real_reference = solve_traveling_wave_engine_fixed_frequency(
             config,
             frequency_hz=f_real_guess,
@@ -457,16 +484,32 @@ def solve_traveling_wave_engine_complex_frequency(
             verbose=False,
         )
         ref_result: TBranchLoopResult = real_reference["result"]
-        u1_input = ref_result.U1_input
+        if u1_phase_fixed_rad is None:
+            u1_phase_fixed_rad = float(np.angle(ref_result.U1_input))
+        if u1_mag_guess is None:
+            u1_mag_guess = float(abs(ref_result.U1_input))
         if zb_real_guess is None:
             zb_real_guess = ref_result.Zb_real
         if zb_imag_guess is None:
             zb_imag_guess = ref_result.Zb_imag
 
+    assert u1_phase_fixed_rad is not None
+    assert u1_mag_guess is not None
+
     if zb_real_guess is None:
         zb_real_guess = config.zb_real_guess
     if zb_imag_guess is None:
         zb_imag_guess = config.zb_imag_guess
+
+    if p_norm is None:
+        if real_reference is not None:
+            p_norm_local = float(np.real(real_reference["result"].p1_union))
+        else:
+            p_norm_local = float(abs(config.p1_input))
+    else:
+        p_norm_local = float(p_norm)
+    if p_norm_local <= 0.0:
+        p_norm_local = 1000.0
 
     helium = gas.Helium(mean_pressure=config.mean_pressure)
     trunk_segments, branch_segments = build_traveling_wave_paths(config, t_hot=t_hot)
@@ -479,41 +522,51 @@ def solve_traveling_wave_engine_complex_frequency(
         n_points_per_segment=config.n_points_per_segment,
     )
 
-    freq_scale = max(abs(f_real_guess), 1.0)
+    freq_ref = max(abs(f_real_guess), 1.0)
+    freq_span = (
+        max(0.1 * freq_ref, 2.0)
+        if f_real_span_hz is None
+        else max(float(f_real_span_hz), 0.5)
+    )
     imag_scale = max(abs(f_imag_guess), 1.0)
+    u1_scale = max(abs(u1_mag_guess), 1e-9)
     z_scale = max(abs(zb_real_guess), abs(zb_imag_guess), 1e3)
-    u_scale = max(abs(u1_input), 1e-9)
 
     def residual(x: np.ndarray) -> np.ndarray:
-        f_real = x[0] * freq_scale
+        # Keep the solve on the continuation branch and avoid mode hopping.
+        f_real = freq_ref + freq_span * np.tanh(x[0])
         f_imag = x[1] * imag_scale
-        zb_real = x[2] * z_scale
-        zb_imag = x[3] * z_scale
+        u1_mag = x[2] * u1_scale
+        zb_real = x[3] * z_scale
+        zb_imag = x[4] * z_scale
+        u1_input = u1_mag * np.exp(1j * u1_phase_fixed_rad)
         omega = 2.0 * np.pi * (f_real + 1j * f_imag)
         propagator.omega = omega
         try:
-            _p1_union, u1_hardend, p_mismatch = propagator(
-                config.p1_input,
+            p1_union, u1_hardend, p_mismatch = propagator(
+                p_norm_local + 0j,
                 u1_input,
                 complex(zb_real, zb_imag),
             )
         except Exception:
-            return np.array([1e8, 1e8, 1e8, 1e8], dtype=float)
+            return np.array([1e8, 1e8, 1e8, 1e8, 1e8], dtype=float)
 
         return np.array(
             [
-                p_mismatch.real / 1000.0,
-                p_mismatch.imag / 1000.0,
-                u1_hardend.real / u_scale,
-                u1_hardend.imag / u_scale,
+                p_mismatch.real / p_norm_local,
+                p_mismatch.imag / p_norm_local,
+                u1_hardend.real / u1_scale,
+                u1_hardend.imag / u1_scale,
+                (p1_union.real - p_norm_local) / p_norm_local,
             ],
             dtype=float,
         )
 
     x0 = np.array(
         [
-            f_real_guess / freq_scale,
+            0.0,
             f_imag_guess / imag_scale,
+            u1_mag_guess / u1_scale,
             zb_real_guess / z_scale,
             zb_imag_guess / z_scale,
         ],
@@ -522,31 +575,69 @@ def solve_traveling_wave_engine_complex_frequency(
     tol_local = config.tol if tol is None else tol
     maxiter_local = config.maxiter if maxiter is None else maxiter
 
-    result = root(
+    result_hybr = root(
         residual,
         x0,
         method="hybr",
         tol=tol_local,
         options={"maxfev": maxiter_local * 20},
     )
-    if not result.success:
-        result = root(
-            residual,
-            x0,
-            method="lm",
-            tol=tol_local,
-            options={"maxiter": maxiter_local * 20},
-        )
+    result_lm = root(
+        residual,
+        x0,
+        method="lm",
+        tol=tol_local,
+        options={"maxiter": maxiter_local * 20},
+    )
+    result_ls = least_squares(
+        residual,
+        x0,
+        method="trf",
+        max_nfev=maxiter_local * 40,
+        xtol=tol_local,
+        ftol=tol_local,
+        gtol=tol_local,
+    )
 
-    f_real = float(result.x[0] * freq_scale)
-    f_imag = float(result.x[1] * imag_scale)
-    zb_real = float(result.x[2] * z_scale)
-    zb_imag = float(result.x[3] * z_scale)
+    candidates: list[tuple[np.ndarray, np.ndarray, bool, str, int]] = [
+        (
+            np.asarray(result_hybr.x, dtype=float),
+            np.asarray(result_hybr.fun, dtype=float),
+            bool(result_hybr.success),
+            str(result_hybr.message),
+            int(getattr(result_hybr, "nfev", 0)),
+        ),
+        (
+            np.asarray(result_lm.x, dtype=float),
+            np.asarray(result_lm.fun, dtype=float),
+            bool(result_lm.success),
+            str(result_lm.message),
+            int(getattr(result_lm, "nfev", 0)),
+        ),
+        (
+            np.asarray(result_ls.x, dtype=float),
+            np.asarray(result_ls.fun, dtype=float),
+            bool(result_ls.success),
+            str(result_ls.message),
+            int(getattr(result_ls, "nfev", 0)),
+        ),
+    ]
+    best_x, best_fun, best_success, best_message, best_nfev = min(
+        candidates,
+        key=lambda c: float(np.linalg.norm(c[1])),
+    )
+
+    f_real = float(freq_ref + freq_span * np.tanh(best_x[0]))
+    f_imag = float(best_x[1] * imag_scale)
+    u1_mag = float(best_x[2] * u1_scale)
+    zb_real = float(best_x[3] * z_scale)
+    zb_imag = float(best_x[4] * z_scale)
+    u1_input = u1_mag * np.exp(1j * u1_phase_fixed_rad)
     omega = 2.0 * np.pi * (f_real + 1j * f_imag)
     propagator.omega = omega
 
     p1_union, u1_hardend, p_mismatch = propagator(
-        config.p1_input,
+        p_norm_local + 0j,
         u1_input,
         complex(zb_real, zb_imag),
     )
@@ -561,25 +652,34 @@ def solve_traveling_wave_engine_complex_frequency(
             "complex solve: "
             f"T_hot={t_hot:.1f} K, "
             f"f={f_real:.3f}+j{f_imag:.3f} Hz, "
-            f"residual={np.linalg.norm(result.fun):.3e}"
+            f"|U1|={u1_mag:.3e}, "
+            f"residual={np.linalg.norm(best_fun):.3e}"
         )
 
+    residual_norm = float(np.linalg.norm(best_fun))
+    converged = bool(best_success) or residual_norm < 0.2
+
     return {
-        "converged": bool(result.success),
-        "message": str(result.message),
-        "n_iterations": int(getattr(result, "nfev", 0)),
-        "residual_norm": float(np.linalg.norm(result.fun)),
+        "converged": converged,
+        "method_success": bool(best_success),
+        "message": str(best_message),
+        "n_iterations": best_nfev,
+        "residual_norm": residual_norm,
         "frequency_real": f_real,
         "frequency_imag": f_imag,
         "omega": omega,
+        "u1_magnitude": u1_mag,
+        "u1_phase_fixed_rad": float(u1_phase_fixed_rad),
         "zb_real": zb_real,
         "zb_imag": zb_imag,
         "zb": complex(zb_real, zb_imag),
-        "p1_input": config.p1_input,
+        "p1_input": p_norm_local + 0j,
         "u1_input": u1_input,
         "p1_union": p1_union,
         "u1_hardend": u1_hardend,
         "pressure_mismatch": p_mismatch,
+        "normalization_residual": float(p1_union.real - p_norm_local),
+        "p_norm": p_norm_local,
         "profiles": profiles,
         "branch_power_deltas": branch_deltas,
         "trunk_power_deltas": trunk_deltas,
@@ -600,6 +700,21 @@ def sweep_traveling_wave_complex_frequency(
     t_hot_values: np.ndarray,
     f_real_guess: float,
     f_imag_guess: float = 0.0,
+    p_norm: float | None = None,
+    real_ref_search_span_hz: float = 0.0,
+    real_ref_search_step_hz: float = 0.0,
+    phase_relaxation_deg: tuple[float, ...] = (0.0, 5.0, -5.0, 15.0, -15.0),
+    residual_accept: float = 1e-4,
+    mode_lock_max_step_hz: float = 12.0,
+    mode_lock_max_step_frac: float = 0.15,
+    mode_lock_ref_weight: float = 0.5,
+    mode_anchor_search_span_hz: float = 60.0,
+    mode_anchor_search_step_hz: float = 10.0,
+    mode_lock_anchor_band_hz: float = 20.0,
+    mode_lock_anchor_weight: float = 1.0,
+    mode_signature_phase_band_deg: float = 25.0,
+    mode_signature_phase_weight: float = 0.5,
+    mode_signature_power_weight: float = 1.0,
 ) -> list[dict[str, Any]]:
     """
     Sweep hot temperature using complex-frequency solve with continuation.
@@ -617,11 +732,44 @@ def sweep_traveling_wave_complex_frequency(
     u1_phase = config.u1_phase_guess
     zb_real = config.zb_real_guess
     zb_imag = config.zb_imag_guess
+    anchor_frequency = float(f_real_guess)
+    signature_phase_deg: float | None = None
+    signature_branch_sign: int | None = None
+    signature_trunk_sign: int | None = None
+
+    if mode_anchor_search_span_hz > 0.0 and mode_anchor_search_step_hz > 0.0:
+        t0 = float(t_hot_values[0]) if len(t_hot_values) else float(config.t_hot)
+        fmin = max(1.0, anchor_frequency - mode_anchor_search_span_hz)
+        fmax = anchor_frequency + mode_anchor_search_span_hz
+        freq_grid = np.arange(fmin, fmax + mode_anchor_search_step_hz, mode_anchor_search_step_hz)
+        freq_sweep = sweep_traveling_wave_frequency(
+            config,
+            frequencies_hz=freq_grid,
+            t_hot=t0,
+        )
+        best_seed = find_best_frequency_by_residual(freq_sweep)
+        anchor_frequency = float(best_seed["frequency_hz"])
+        f_real = anchor_frequency
 
     for t_hot in t_hot_values:
+        ref_frequency = float(f_real)
+        if real_ref_search_span_hz > 0.0 and real_ref_search_step_hz > 0.0:
+            fmin = max(1.0, ref_frequency - real_ref_search_span_hz)
+            fmax = ref_frequency + real_ref_search_span_hz
+            freq_grid = np.arange(
+                fmin, fmax + real_ref_search_step_hz, real_ref_search_step_hz
+            )
+            freq_sweep = sweep_traveling_wave_frequency(
+                config,
+                frequencies_hz=freq_grid,
+                t_hot=float(t_hot),
+            )
+            best_real = find_best_frequency_by_residual(freq_sweep)
+            ref_frequency = float(best_real["frequency_hz"])
+
         real_point = solve_traveling_wave_engine_fixed_frequency(
             config,
-            frequency_hz=float(f_real),
+            frequency_hz=ref_frequency,
             t_hot=float(t_hot),
             u1_mag_guess=u1_mag,
             u1_phase_guess=u1_phase,
@@ -633,21 +781,126 @@ def sweep_traveling_wave_complex_frequency(
         u1_mag = real_result.U1_magnitude
         u1_phase = real_result.U1_phase
 
-        point = solve_traveling_wave_engine_complex_frequency(
-            config,
-            t_hot=float(t_hot),
-            f_real_guess=float(f_real),
-            f_imag_guess=float(f_imag),
-            u1_input=real_result.U1_input,
-            zb_real_guess=real_result.Zb_real,
-            zb_imag_guess=real_result.Zb_imag,
-            verbose=False,
+        point = None
+        phase_ref = float(np.angle(real_result.U1_input))
+        prev_frequency = float(f_real)
+        pnorm_use = float(np.real(real_result.p1_union)) if p_norm is None else float(p_norm)
+        max_step = max(
+            float(mode_lock_max_step_hz),
+            float(mode_lock_max_step_frac) * max(prev_frequency, 1.0),
         )
+        candidate_centers = [ref_frequency, anchor_frequency]
+        if abs(ref_frequency - prev_frequency) > 1e-12:
+            candidate_centers.append(prev_frequency)
+        scored_candidates: list[tuple[float, dict[str, Any]]] = []
+
+        def candidate_score(candidate: dict[str, Any]) -> float:
+            freq_jump = abs(float(candidate["frequency_real"]) - prev_frequency)
+            jump_penalty = 10.0 * max(0.0, freq_jump - max_step)
+            ref_offset = abs(float(candidate["frequency_real"]) - ref_frequency)
+            ref_penalty = float(mode_lock_ref_weight) * max(0.0, ref_offset - max_step)
+            anchor_offset = abs(float(candidate["frequency_real"]) - anchor_frequency)
+            anchor_penalty = float(mode_lock_anchor_weight) * max(
+                0.0, anchor_offset - float(mode_lock_anchor_band_hz)
+            )
+            phase_penalty = 0.0
+            if signature_phase_deg is not None:
+                phase_now = candidate.get("phase_regenerator_mid_deg")
+                if phase_now is None or not np.isfinite(float(phase_now)):
+                    phase_penalty = 10.0
+                else:
+                    phase_err = _phase_difference_deg(float(phase_now), signature_phase_deg)
+                    phase_penalty = float(mode_signature_phase_weight) * max(
+                        0.0, phase_err - float(mode_signature_phase_band_deg)
+                    ) / 180.0
+
+            power_penalty = 0.0
+            branch_sign = _dominant_power_sign(list(candidate.get("branch_power_profile", [])))
+            trunk_sign = _dominant_power_sign(list(candidate.get("trunk_power_profile", [])))
+            if signature_branch_sign is not None and branch_sign is not None:
+                if branch_sign != signature_branch_sign:
+                    power_penalty += float(mode_signature_power_weight)
+            if signature_trunk_sign is not None and trunk_sign is not None:
+                if trunk_sign != signature_trunk_sign:
+                    power_penalty += float(mode_signature_power_weight)
+
+            return (
+                float(candidate["residual_norm"])
+                + jump_penalty
+                + ref_penalty
+                + anchor_penalty
+                + phase_penalty
+                + power_penalty
+            )
+
+        for phase_offset in phase_relaxation_deg:
+            for center in candidate_centers:
+                candidate = solve_traveling_wave_engine_complex_frequency(
+                    config,
+                    t_hot=float(t_hot),
+                    f_real_guess=float(center),
+                    f_imag_guess=float(f_imag),
+                    u1_mag_guess=float(u1_mag),
+                    u1_phase_fixed_rad=phase_ref + np.radians(phase_offset),
+                    zb_real_guess=real_result.Zb_real,
+                    zb_imag_guess=real_result.Zb_imag,
+                    p_norm=pnorm_use,
+                    f_real_span_hz=max(0.2 * center, max_step, 2.0),
+                    verbose=False,
+                )
+                score = candidate_score(candidate)
+                scored_candidates.append((score, candidate))
+                if point is None or score < candidate_score(point):
+                    point = candidate
+            if point is not None and float(point["residual_norm"]) <= residual_accept:
+                break
+
+        assert point is not None
+
+        # Hard mode-lock retry if best candidate still jumps too far.
+        if abs(float(point["frequency_real"]) - prev_frequency) > max_step:
+            locked = solve_traveling_wave_engine_complex_frequency(
+                config,
+                t_hot=float(t_hot),
+                f_real_guess=prev_frequency,
+                f_imag_guess=float(f_imag),
+                u1_mag_guess=float(u1_mag),
+                u1_phase_fixed_rad=phase_ref,
+                zb_real_guess=real_result.Zb_real,
+                zb_imag_guess=real_result.Zb_imag,
+                p_norm=pnorm_use,
+                f_real_span_hz=max_step,
+                verbose=False,
+            )
+            if candidate_score(locked) <= candidate_score(point):
+                point = locked
+
         point["real_frequency_reference"] = real_point
+        if signature_phase_deg is None:
+            phase_val = point.get("phase_regenerator_mid_deg")
+            if phase_val is not None and np.isfinite(float(phase_val)):
+                signature_phase_deg = float(phase_val)
+        if signature_branch_sign is None:
+            signature_branch_sign = _dominant_power_sign(
+                list(point.get("branch_power_profile", []))
+            )
+        if signature_trunk_sign is None:
+            signature_trunk_sign = _dominant_power_sign(
+                list(point.get("trunk_power_profile", []))
+            )
+        point["mode_signature_phase_deg"] = signature_phase_deg
+        point["mode_signature_branch_sign"] = signature_branch_sign
+        point["mode_signature_trunk_sign"] = signature_trunk_sign
+        if signature_phase_deg is not None and point.get("phase_regenerator_mid_deg") is not None:
+            point["mode_phase_error_deg"] = _phase_difference_deg(
+                float(point["phase_regenerator_mid_deg"]),
+                signature_phase_deg,
+            )
         points.append(point)
 
         f_real = float(point["frequency_real"])
         f_imag = float(point["frequency_imag"])
+        u1_mag = float(point["u1_magnitude"])
         zb_real = float(point["zb_real"])
         zb_imag = float(point["zb_imag"])
 
@@ -658,6 +911,7 @@ def detect_onset_from_complex_frequency(
     sweep: list[dict[str, Any]],
     *,
     f_imag_tol_hz: float = 1e-4,
+    max_residual_norm: float | None = None,
 ) -> float | None:
     """
     Detect onset ratio from `f_imag` sign crossing.
@@ -666,6 +920,11 @@ def detect_onset_from_complex_frequency(
     non-positive (growing).
     """
     for i in range(len(sweep) - 1):
+        if max_residual_norm is not None:
+            r0 = float(sweep[i].get("residual_norm", np.inf))
+            r1 = float(sweep[i + 1].get("residual_norm", np.inf))
+            if r0 > max_residual_norm or r1 > max_residual_norm:
+                continue
         fi0 = float(sweep[i]["frequency_imag"])
         fi1 = float(sweep[i + 1]["frequency_imag"])
         if fi0 > f_imag_tol_hz and fi1 < -f_imag_tol_hz:
@@ -675,6 +934,111 @@ def detect_onset_from_complex_frequency(
                 return r1
             return r0 + (r1 - r0) * (fi0 / (fi0 - fi1))
     return None
+
+
+def sweep_traveling_wave_complex_frequency_multimode(
+    config: TravelingWaveEngineConfig,
+    *,
+    t_hot_values: np.ndarray,
+    mode_frequency_guesses_hz: list[float],
+    f_imag_guess: float = 0.0,
+    p_norm: float | None = None,
+    onset_residual_filter: float = 0.2,
+    proxy_frequency_hz: float | None = None,
+) -> dict[str, Any]:
+    """
+    Run multiple anchored complex-frequency sweeps and pick a best branch.
+
+    The selected branch is scored by sweep residual quality and optional
+    agreement with gain-proxy onset ratio.
+    """
+    if not mode_frequency_guesses_hz:
+        raise ValueError("mode_frequency_guesses_hz must not be empty.")
+
+    proxy_freq = float(mode_frequency_guesses_hz[0] if proxy_frequency_hz is None else proxy_frequency_hz)
+    proxy_onset, _proxy_sweep = find_onset_ratio_proxy(
+        config,
+        frequency_hz=proxy_freq,
+        t_hot_min=float(np.min(t_hot_values)),
+        t_hot_max=float(np.max(t_hot_values)),
+        coarse_step=100.0,
+        fine_step=20.0,
+    )
+
+    branches: list[dict[str, Any]] = []
+    for f_guess in mode_frequency_guesses_hz:
+        sweep = sweep_traveling_wave_complex_frequency(
+            config,
+            t_hot_values=t_hot_values,
+            f_real_guess=float(f_guess),
+            f_imag_guess=f_imag_guess,
+            p_norm=p_norm,
+        )
+        onset = detect_onset_from_complex_frequency(
+            sweep,
+            max_residual_norm=onset_residual_filter,
+        )
+        residuals = np.array([float(p["residual_norm"]) for p in sweep], dtype=float)
+        branch: dict[str, Any] = {
+            "f_real_guess": float(f_guess),
+            "sweep": sweep,
+            "onset_ratio_complex": onset,
+            "residual_median": float(np.median(residuals)),
+            "residual_max": float(np.max(residuals)),
+        }
+        if onset is None or proxy_onset is None:
+            branch["agreement_error"] = float("inf")
+        else:
+            branch["agreement_error"] = float(abs(onset - proxy_onset) / max(proxy_onset, 1e-12))
+        branches.append(branch)
+
+    def _branch_score(branch: dict[str, Any]) -> float:
+        score = float(branch["residual_median"])
+        if np.isfinite(float(branch["agreement_error"])):
+            score += float(branch["agreement_error"])
+        else:
+            score += 1.0
+        return score
+
+    selected_idx = min(range(len(branches)), key=lambda i: _branch_score(branches[i]))
+    return {
+        "proxy_onset_ratio": proxy_onset,
+        "branches": branches,
+        "selected_index": int(selected_idx),
+        "selected_branch": branches[selected_idx],
+    }
+
+
+def summarize_multimode_selection(result: dict[str, Any]) -> list[dict[str, float | int | bool]]:
+    """
+    Build compact branch-comparison rows for multimode selection diagnostics.
+    """
+    rows: list[dict[str, float | int | bool]] = []
+    selected_index = int(result["selected_index"])
+    proxy_onset = result.get("proxy_onset_ratio")
+
+    for idx, branch in enumerate(result["branches"]):
+        onset = branch.get("onset_ratio_complex")
+        agreement = branch.get("agreement_error")
+        if (
+            (agreement is None or not np.isfinite(float(agreement)))
+            and onset is not None
+            and proxy_onset is not None
+            and np.isfinite(float(proxy_onset))
+        ):
+            agreement = abs(float(onset) - float(proxy_onset)) / max(float(proxy_onset), 1e-12)
+        rows.append(
+            {
+                "branch_index": int(idx),
+                "selected": bool(idx == selected_index),
+                "f_guess_hz": float(branch["f_real_guess"]),
+                "residual_median": float(branch["residual_median"]),
+                "residual_max": float(branch["residual_max"]),
+                "onset_ratio_complex": float("nan") if onset is None else float(onset),
+                "agreement_error": float("nan") if agreement is None else float(agreement),
+            }
+        )
+    return rows
 
 
 def find_onset_ratio_proxy(

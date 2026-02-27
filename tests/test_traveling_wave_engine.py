@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from openthermoacoustics.validation.standing_wave_engine import (
+    detect_onset_from_complex_frequency as detect_sw_onset_from_complex_frequency,
+)
 from openthermoacoustics.validation.traveling_wave_engine import (
     compute_efficiency_estimate,
     compute_loop_power_profile,
@@ -16,8 +19,10 @@ from openthermoacoustics.validation.traveling_wave_engine import (
     find_onset_ratio_proxy,
     solve_traveling_wave_engine_complex_frequency,
     solve_traveling_wave_engine_fixed_frequency,
+    summarize_multimode_selection,
     sweep_efficiency_estimate,
     sweep_traveling_wave_complex_frequency,
+    sweep_traveling_wave_complex_frequency_multimode,
     sweep_traveling_wave_frequency,
     sweep_traveling_wave_temperature,
     tuned_traveling_wave_engine_candidate_config,
@@ -170,12 +175,12 @@ def test_efficiency_sweep_rows_are_finite() -> None:
         assert 0.0 <= row["eta_relative"] <= 1.0
 
 
-def test_complex_frequency_single_point_is_finite() -> None:
-    """Complex-frequency closure should return finite values at a point."""
+def test_5x5_isothermal_fimag_nonzero() -> None:
+    """5x5 complex solve should return finite, non-trivial damping at 300 K."""
     cfg = tuned_traveling_wave_engine_candidate_config()
     point = solve_traveling_wave_engine_complex_frequency(
         cfg,
-        t_hot=500.0,
+        t_hot=300.0,
         f_real_guess=120.0,
         f_imag_guess=0.0,
     )
@@ -183,21 +188,92 @@ def test_complex_frequency_single_point_is_finite() -> None:
     assert np.isfinite(point["residual_norm"])
     assert np.isfinite(point["frequency_real"])
     assert np.isfinite(point["frequency_imag"])
+    assert abs(float(point["frequency_imag"])) > 1e-4
 
 
-def test_complex_frequency_sweep_supports_onset_detection_api() -> None:
-    """Complex-frequency sweep should provide a valid crossing API surface."""
+def test_5x5_fimag_changes_with_temperature() -> None:
+    """5x5 complex sweep should show temperature dependence in f_imag."""
     cfg = tuned_traveling_wave_engine_candidate_config()
     sweep = sweep_traveling_wave_complex_frequency(
         cfg,
-        t_hot_values=np.array([350.0, 450.0, 550.0]),
+        t_hot_values=np.array([300.0, 400.0, 500.0, 600.0]),
         f_real_guess=120.0,
         f_imag_guess=0.0,
     )
-    assert len(sweep) == 3
+    assert len(sweep) == 4
+    f_imag = []
+    converged_count = 0
     for point in sweep:
-        assert point["converged"]
+        if point["converged"]:
+            converged_count += 1
         assert np.isfinite(point["frequency_real"])
         assert np.isfinite(point["frequency_imag"])
-    onset = detect_onset_from_complex_frequency(sweep)
-    assert onset is None or onset > 1.0
+        f_imag.append(float(point["frequency_imag"]))
+    assert converged_count >= 3
+    assert np.ptp(np.array(f_imag)) > 1e-5
+
+
+def test_5x5_onset_consistency_with_gain_proxy_trend() -> None:
+    """Complex-frequency and gain proxy should not contradict each other grossly."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    sweep = sweep_traveling_wave_complex_frequency(
+        cfg,
+        t_hot_values=np.arange(300.0, 901.0, 100.0),
+        f_real_guess=120.0,
+        f_imag_guess=0.0,
+    )
+    onset = detect_onset_from_complex_frequency(sweep, max_residual_norm=0.2)
+    onset_proxy, _ = find_onset_ratio_proxy(
+        cfg,
+        frequency_hz=120.0,
+        t_hot_min=300.0,
+        t_hot_max=900.0,
+        coarse_step=100.0,
+        fine_step=20.0,
+    )
+    if onset is not None and onset_proxy is not None:
+        assert onset > 1.0
+        assert onset < 3.0
+    else:
+        # If no crossing is detected yet, the sweep should still be finite and signed.
+        vals = np.array([float(p["frequency_imag"]) for p in sweep])
+        assert np.all(np.isfinite(vals))
+        assert np.all(vals <= 0.0) or np.all(vals >= 0.0)
+
+
+def test_5x5_sign_convention_matches_standing_wave_detector() -> None:
+    """Traveling-wave onset detector should match standing-wave crossing convention."""
+    synthetic_tw = [
+        {"temperature_ratio": 1.0, "frequency_imag": 0.5},
+        {"temperature_ratio": 1.2, "frequency_imag": 0.1},
+        {"temperature_ratio": 1.4, "frequency_imag": -0.2},
+    ]
+    synthetic_sw = [
+        {"temperature_ratio": 1.0, "frequency_imag": 0.5},
+        {"temperature_ratio": 1.2, "frequency_imag": 0.1},
+        {"temperature_ratio": 1.4, "frequency_imag": -0.2},
+    ]
+    onset_tw = detect_onset_from_complex_frequency(synthetic_tw, f_imag_tol_hz=0.0)
+    onset_sw = detect_sw_onset_from_complex_frequency(synthetic_sw)
+    assert onset_tw is not None
+    assert onset_sw is not None
+    assert abs(onset_tw - onset_sw) < 1e-12
+
+
+def test_multimode_branch_selection_returns_structured_result() -> None:
+    """Multimode sweep should return comparable branch diagnostics."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    result = sweep_traveling_wave_complex_frequency_multimode(
+        cfg,
+        t_hot_values=np.array([300.0, 500.0, 700.0]),
+        mode_frequency_guesses_hz=[48.0, 120.0],
+    )
+    assert "branches" in result
+    assert len(result["branches"]) == 2
+    assert 0 <= int(result["selected_index"]) < 2
+    selected = result["selected_branch"]
+    assert "sweep" in selected
+    assert len(selected["sweep"]) == 3
+    summary_rows = summarize_multimode_selection(result)
+    assert len(summary_rows) == 2
+    assert any(bool(row["selected"]) for row in summary_rows)

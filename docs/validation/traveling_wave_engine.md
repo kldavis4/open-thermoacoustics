@@ -8,7 +8,7 @@ for looped topologies:
 `TBRANCH -> trunk(resonator -> HARDEND)` and  
 `TBRANCH -> branch(AHX1 -> regenerator -> HHX -> TBT -> AHX2 -> feedback) -> UNION`
 
-The current solver uses a 4x4 shooting system:
+The base loop closure uses a 4x4 shooting system:
 
 - Unknowns: `|U1|`, `phase(U1)`, `Re(Zb)`, `Im(Zb)`
 - Targets: `Re/Im(p_mismatch at UNION)=0`, `Re/Im(U1_hardend)=0`
@@ -27,6 +27,10 @@ Implemented in `src/openthermoacoustics/validation/traveling_wave_engine.py`:
 - `sweep_traveling_wave_complex_frequency`: temperature continuation sweep
 - `detect_onset_from_complex_frequency`: onset ratio from `f_imag` crossing
   (with configurable deadband tolerance for numerical noise)
+  and optional residual-quality filtering.
+- `sweep_traveling_wave_complex_frequency_multimode`: runs multiple anchored
+  branches and selects the best candidate branch.
+- `summarize_multimode_selection`: compact selected-vs-alternate branch report.
 - `compute_regenerator_phase_profile`: inlet/mid/outlet phase diagnostics
 - `compute_loop_power_profile`: boundary acoustic powers by segment
 - `compute_efficiency_estimate`: first-order efficiency estimate with Carnot bound
@@ -49,14 +53,23 @@ Observed (proxy method):
   `-96°` (mid), `-93°` (outlet)
 - Net gain proxy at `600 K`: positive
 
-Complex-frequency formulation details:
+Complex-frequency formulation details (augmented 5x5):
 
-- Unknowns per temperature point: `f_real`, `f_imag`, `Re(Zb)`, `Im(Zb)`
-- Targets: `Re/Im(p_mismatch)=0`, `Re/Im(U1_hardend)=0`
-- Gauge/closure: `U1_input` is fixed from the converged real-frequency loop
-  solution at the same temperature.
-- Continuation: sweep in `T_hot`, seeding each point from previous
-  `(f_real, f_imag, Zb)` plus a refreshed real-frequency reference.
+- Unknowns: `f_real`, `f_imag`, `|U1_input|`, `Re(Zb)`, `Im(Zb)`
+- Fixed gauge:
+  `p1_input = p_norm + 0j` (phase convention),
+  `phase(U1_input)` from real-frequency reference
+- Targets:
+  `Re/Im(p_mismatch)=0`,
+  `Re/Im(U1_hardend)=0`,
+  `Re(p1_trunk_end)-p_norm=0` (normalization)
+- Continuation:
+  sweep in `T_hot`, re-solving real-frequency reference each step for phase,
+  and seeding `(f_real, f_imag, |U1|, Zb)` from prior point.
+- Mode validation in sweep:
+  candidate branches are scored not only by residual/frequency continuity, but
+  also by regenerator phase consistency and loop power-flow sign consistency
+  relative to an identified anchor mode at the first sweep point.
 
 Interpretation:
 
@@ -93,6 +106,7 @@ comparisons are qualitative/dimensionless.
 
 - Distributed-loop plumbing is complete and tested.
 - Power/phase/efficiency diagnostics are in place for optimization loops.
-- Next milestone: remove the fixed-`U1_input` gauge by promoting a fully coupled
-  augmented formulation (frequency + state + impedance) with an explicit
-  normalization constraint.
+- The 5x5 augmentation is in place and produces non-trivial `f_imag` values.
+- Next milestone: tighten mode-tracking and reduce residuals further near
+  low-loss operating points (e.g., with adaptive frequency continuation windows
+  and optional phase-relaxation fallback).
