@@ -16,6 +16,14 @@ Primary onset criterion in this validation is the **complex-frequency crossing**
 
 `dW_stack` is retained as a secondary diagnostic trend only.
 
+### Why `f_imag` Is Primary
+
+For closed-closed standing-wave resonators, local acoustic-power differences can
+be misleading because power flow redistributes with standing-wave phase and can
+change sign locally even when the global mode remains damped. The complex-frequency
+growth rate `f_imag` directly measures modal damping/growth and is therefore the
+physically correct onset criterion for this benchmark.
+
 ## Configurations
 
 - Gas: helium, mean pressure `1.0 MPa`

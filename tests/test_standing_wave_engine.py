@@ -134,6 +134,16 @@ def test_optimized_layout_onset_target_range(
     assert 1.3 <= onset_ratio <= 2.5
 
 
+def test_optimized_layout_onset_regression_temperature(
+    optimized_complex_sweep: list[dict[str, float | bool | str]],
+) -> None:
+    """Regression guard: optimized onset should stay near the validated ~604 K."""
+    onset_ratio = detect_onset_from_complex_frequency(optimized_complex_sweep)
+    assert onset_ratio is not None
+    onset_hot = onset_ratio * 300.0
+    assert 560.0 <= onset_hot <= 650.0
+
+
 def test_shifted_layout_has_no_onset_below_800k(
     shifted_complex_sweep: list[dict[str, float | bool | str]],
 ) -> None:
