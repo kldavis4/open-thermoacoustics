@@ -28,7 +28,7 @@ def integrate_segment(
     p1_in: complex,
     U1_in: complex,
     T_m: float,
-    omega: float,
+    omega: complex,
     gas: Gas,
     n_points: int = 100,
 ) -> dict[str, NDArray[Any]]:
@@ -202,7 +202,7 @@ def _compute_derivatives(
     x: float,
     y: NDArray[np.float64],
     segment: Segment,
-    omega: float,
+    omega: complex,
     gas: Gas,
     has_temperature_gradient: bool,
 ) -> NDArray[np.float64]:
@@ -316,7 +316,7 @@ def _compute_derivatives(
 def _get_thermoviscous_functions(
     segment: Segment,
     x: float,
-    omega: float,
+    omega: complex,
     gas: Gas,
     T_m: float,
 ) -> tuple[complex, complex]:
@@ -351,9 +351,13 @@ def _get_thermoviscous_functions(
             kappa = gas.thermal_conductivity(T_m)
             cp = gas.specific_heat_cp(T_m)
 
-            omega_mag = max(abs(omega), 1e-12)
-            delta_nu = np.sqrt(2 * mu / (rho * omega_mag))
-            delta_kappa = np.sqrt(2 * kappa / (rho * cp * omega_mag))
+            omega_eff = (
+                complex(omega)
+                if abs(omega) > 1e-12
+                else 1e-12 + 0.0j
+            )
+            delta_nu = np.sqrt(2 * mu / (rho * omega_eff))
+            delta_kappa = np.sqrt(2 * kappa / (rho * cp * omega_eff))
 
             if not hasattr(segment, "hydraulic_radius"):
                 return 0j, 0j
@@ -362,8 +366,8 @@ def _get_thermoviscous_functions(
             # Geometry API in this repo expects:
             #   f_nu(omega, delta_nu, hydraulic_radius)
             #   f_kappa(omega, delta_kappa, hydraulic_radius)
-            f_nu = geometry.f_nu(omega_mag, delta_nu, hydraulic_radius)
-            f_kappa = geometry.f_kappa(omega_mag, delta_kappa, hydraulic_radius)
+            f_nu = geometry.f_nu(omega_eff, delta_nu, hydraulic_radius)
+            f_kappa = geometry.f_kappa(omega_eff, delta_kappa, hydraulic_radius)
             return complex(f_nu), complex(f_kappa)
 
     # Try segment's own thermoviscous function methods
