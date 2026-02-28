@@ -152,6 +152,30 @@ Run tests:
 pytest tests/ -v
 ```
 
+## Publishing
+
+This repository includes a GitHub Actions release workflow at
+`/Users/kelly/projects/personal/deltaec/.github/workflows/publish.yml`.
+
+- Manual run (`workflow_dispatch`) publishes to **TestPyPI**
+- GitHub Release `published` event publishes to **PyPI**
+
+### One-time setup (Trusted Publisher)
+
+1. In PyPI and TestPyPI, create a Trusted Publisher for this GitHub repo.
+2. Map environments:
+   - `pypi` environment -> PyPI trusted publisher
+   - `testpypi` environment -> TestPyPI trusted publisher
+3. In GitHub repo settings, create environments `pypi` and `testpypi`
+   (optionally require approvals).
+
+### Release flow
+
+1. Bump version in `pyproject.toml`.
+2. Merge to `main`.
+3. Run workflow manually to TestPyPI and verify install.
+4. Create GitHub release (for example `v0.1.1`) to publish to PyPI.
+
 Documentation quality gate for changes:
 - If a change affects public API or behavior, update matching docs in `docs/`.
 - At minimum, update the relevant `docs/api/*` page and one usage guide (`getting-started`, `modeling-workflows`, or `troubleshooting`) when applicable.
