@@ -8,21 +8,37 @@ from openthermoacoustics.validation.standing_wave_engine import (
     detect_onset_from_complex_frequency as detect_sw_onset_from_complex_frequency,
 )
 from openthermoacoustics.validation.traveling_wave_engine import (
+    compute_branch_transfer_matrix,
     compute_efficiency_estimate,
+    compute_energy_balance_growth_rate,
     compute_loop_power_profile,
+    compute_net_acoustic_power,
     compute_regenerator_phase_profile,
+    compute_stored_energy,
+    compute_trunk_transfer_matrix,
     default_traveling_wave_engine_config,
     detect_onset_from_complex_frequency,
     detect_onset_from_gain_proxy,
     estimate_loop_frequency_range,
+    evaluate_traveling_wave_boundary_determinant,
     find_best_frequency_by_residual,
     find_onset_ratio_proxy,
+    scan_loop_eigenvalues,
+    scan_loop_eigenvalues_multi_temp,
+    solve_loop_lambda_unity,
+    solve_loop_self_oscillation,
     solve_traveling_wave_engine_complex_frequency,
+    solve_traveling_wave_engine_determinant_complex_frequency,
     solve_traveling_wave_engine_fixed_frequency,
     summarize_multimode_selection,
     sweep_efficiency_estimate,
+    sweep_energy_balance_growth_rate,
+    sweep_loop_lambda_unity,
+    sweep_loop_self_oscillation,
     sweep_traveling_wave_complex_frequency,
     sweep_traveling_wave_complex_frequency_multimode,
+    sweep_traveling_wave_determinant_complex_frequency,
+    sweep_traveling_wave_determinant_complex_frequency_multimode,
     sweep_traveling_wave_frequency,
     sweep_traveling_wave_temperature,
     tuned_traveling_wave_engine_candidate_config,
@@ -175,6 +191,67 @@ def test_efficiency_sweep_rows_are_finite() -> None:
         assert 0.0 <= row["eta_relative"] <= 1.0
 
 
+def test_energy_balance_signs_match_physical_expectation() -> None:
+    """Isothermal should dissipate net power; hot case should produce net power."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point_cold = solve_traveling_wave_engine_fixed_frequency(cfg, frequency_hz=120.0, t_hot=300.0)
+    point_hot = solve_traveling_wave_engine_fixed_frequency(cfg, frequency_hz=120.0, t_hot=600.0)
+
+    w_cold = compute_net_acoustic_power(cfg, t_hot=300.0, solve_result=point_cold)
+    w_hot = compute_net_acoustic_power(cfg, t_hot=600.0, solve_result=point_hot)
+
+    assert w_cold < 0.0
+    assert w_hot > 0.0
+
+
+def test_energy_balance_growth_rate_crosses_sign_near_proxy_onset() -> None:
+    """Energy-balance growth-rate crossing should be consistent with proxy onset."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    rows = sweep_energy_balance_growth_rate(
+        cfg,
+        t_hot_values=np.arange(300.0, 901.0, 50.0),
+        frequency_guess_hz=120.0,
+    )
+    f_imag = np.array([float(r["frequency_imag_energy_balance"]) for r in rows], dtype=float)
+    assert np.all(np.isfinite(f_imag))
+    assert np.any(f_imag > 0.0)
+    assert np.any(f_imag < 0.0)
+
+    crossing_ratio = None
+    for i in range(len(rows) - 1):
+        y0 = float(rows[i]["frequency_imag_energy_balance"])
+        y1 = float(rows[i + 1]["frequency_imag_energy_balance"])
+        if y0 >= 0.0 and y1 <= 0.0:
+            t0 = float(rows[i]["t_hot"])
+            t1 = float(rows[i + 1]["t_hot"])
+            frac = 0.0 if abs(y1 - y0) < 1e-14 else (0.0 - y0) / (y1 - y0)
+            crossing_ratio = (t0 + frac * (t1 - t0)) / cfg.t_cold
+            break
+
+    proxy_ratio, _ = find_onset_ratio_proxy(
+        cfg,
+        frequency_hz=120.0,
+        t_hot_min=300.0,
+        t_hot_max=900.0,
+        coarse_step=100.0,
+        fine_step=20.0,
+    )
+    assert crossing_ratio is not None
+    assert proxy_ratio is not None
+    assert abs(crossing_ratio - proxy_ratio) < 0.2
+
+
+def test_stored_energy_positive_and_growth_rate_finite() -> None:
+    """Stored energy should be positive and produce finite growth-rate estimate."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point = solve_traveling_wave_engine_fixed_frequency(cfg, frequency_hz=120.0, t_hot=600.0)
+    e_stored = compute_stored_energy(cfg, t_hot=600.0, solve_result=point)
+    f_imag = compute_energy_balance_growth_rate(cfg, t_hot=600.0, solve_result=point)
+
+    assert e_stored > 0.0
+    assert np.isfinite(f_imag)
+
+
 def test_5x5_isothermal_fimag_nonzero() -> None:
     """5x5 complex solve should return finite, non-trivial damping at 300 K."""
     cfg = tuned_traveling_wave_engine_candidate_config()
@@ -277,3 +354,194 @@ def test_multimode_branch_selection_returns_structured_result() -> None:
     summary_rows = summarize_multimode_selection(result)
     assert len(summary_rows) == 2
     assert any(bool(row["selected"]) for row in summary_rows)
+
+
+def test_transfer_matrix_linearity() -> None:
+    """Trunk and branch transfer matrices should map basis vectors linearly."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    omega = 2.0 * np.pi * 120.0
+    t_hot = 500.0
+    tt = compute_trunk_transfer_matrix(cfg, t_hot=t_hot, omega=omega)
+    tb = compute_branch_transfer_matrix(cfg, t_hot=t_hot, omega=omega)
+
+    state = np.array([700.0 + 200.0j, 4e-4 - 1e-4j], dtype=complex)
+    out_t = tt @ state
+    out_b = tb @ state
+    assert np.all(np.isfinite(out_t.real))
+    assert np.all(np.isfinite(out_t.imag))
+    assert np.all(np.isfinite(out_b.real))
+    assert np.all(np.isfinite(out_b.imag))
+
+
+def test_det_small_at_real_frequency_solution() -> None:
+    """Boundary determinant should be small near real-frequency loop closure."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point = solve_traveling_wave_engine_fixed_frequency(cfg, frequency_hz=120.0, t_hot=500.0)
+    det_eval = evaluate_traveling_wave_boundary_determinant(
+        cfg,
+        t_hot=500.0,
+        frequency_real_hz=float(point["frequency_hz"]),
+        frequency_imag_hz=0.0,
+    )
+    assert np.isfinite(det_eval["det_magnitude"])
+    assert float(det_eval["det_magnitude"]) < 5e-1
+
+
+def test_determinant_complex_frequency_solver_runs() -> None:
+    """2x2 determinant-based complex-frequency solve should converge to finite values."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point = solve_traveling_wave_engine_determinant_complex_frequency(
+        cfg,
+        t_hot=500.0,
+        f_real_guess=120.0,
+        f_imag_guess=0.0,
+    )
+    assert point["converged"]
+    assert np.isfinite(point["frequency_real"])
+    assert np.isfinite(point["frequency_imag"])
+    assert np.isfinite(point["det_magnitude"])
+    assert np.isfinite(point["residual_norm"])
+    assert point["residual_norm"] < 5e-2
+
+
+def test_determinant_complex_frequency_sweep_tracks_finite_branch() -> None:
+    """Determinant sweep should produce finite branch values across temperatures."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    sweep = sweep_traveling_wave_determinant_complex_frequency(
+        cfg,
+        t_hot_values=np.array([300.0, 500.0, 700.0]),
+        f_real_guess=120.0,
+        f_imag_guess=0.0,
+    )
+    assert len(sweep) == 3
+    vals = np.array([float(p["frequency_imag"]) for p in sweep], dtype=float)
+    residuals = np.array([float(p["residual_norm"]) for p in sweep], dtype=float)
+    assert np.all(np.isfinite(vals))
+    assert np.all(np.isfinite(residuals))
+    assert np.all(residuals < 1e-2)
+
+
+def test_determinant_multimode_branch_selection_includes_signatures() -> None:
+    """Determinant multimode sweep should attach phase/power signatures."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    result = sweep_traveling_wave_determinant_complex_frequency_multimode(
+        cfg,
+        t_hot_values=np.array([300.0, 500.0]),
+        mode_frequency_guesses_hz=[80.0, 120.0],
+    )
+    assert len(result["branches"]) == 2
+    assert 0 <= int(result["selected_index"]) < 2
+    selected = result["selected_branch"]
+    assert len(selected["sweep"]) == 2
+    for point in selected["sweep"]:
+        assert "phase_regenerator_mid_deg" in point
+        assert "branch_power_sign" in point
+        assert "trunk_power_sign" in point
+
+
+def test_transfer_matrix_sensitive_to_f_imag() -> None:
+    """Trunk transfer matrix should change for nonzero imaginary frequency."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    t_hot = 600.0
+    omega_real = 2.0 * np.pi * 120.0
+    omega_complex = 2.0 * np.pi * (120.0 + 5.0j)
+    t_real = compute_trunk_transfer_matrix(cfg, t_hot=t_hot, omega=omega_real)
+    t_complex = compute_trunk_transfer_matrix(cfg, t_hot=t_hot, omega=omega_complex)
+    diff = float(np.max(np.abs(t_real - t_complex)))
+    scale = max(float(np.max(np.abs(t_real))), 1e-12)
+    rel_diff = diff / scale
+    assert diff > 1e-6
+    assert rel_diff > 1e-4
+
+
+def test_loop_eigenvalue_scan_shows_gain() -> None:
+    """Loop eigenvalue scan should produce finite values and show amplification."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    rows = scan_loop_eigenvalues(
+        cfg,
+        t_hot=600.0,
+        f_real_values=np.linspace(20.0, 300.0, 41),
+    )
+    assert len(rows) == 41
+    max_mag = max(float(max(abs(v) for v in row["eigvals"])) for row in rows)
+    assert np.isfinite(max_mag)
+    assert max_mag > 1.0
+
+
+def test_loop_det_converges_offaxis() -> None:
+    """Loop-only complex solve should converge from an off-axis seed."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point = solve_loop_self_oscillation(
+        cfg,
+        t_hot=600.0,
+        f_real_guess=80.0,
+        f_imag_guess=10.0,
+    )
+    assert point["converged"]
+    assert np.isfinite(point["frequency_real"])
+    assert np.isfinite(point["frequency_imag"])
+    assert point["residual_norm"] < 1.0
+
+
+def test_loop_fimag_crosses_zero() -> None:
+    """Loop-only sweep should return finite f_imag values (crossing if present)."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    sweep = sweep_loop_self_oscillation(
+        cfg,
+        t_hot_values=np.array([300.0, 500.0, 700.0]),
+        f_real_guess=80.0,
+        f_imag_guess=10.0,
+    )
+    vals = np.array([float(p["frequency_imag"]) for p in sweep], dtype=float)
+    assert np.all(np.isfinite(vals))
+    onset = detect_onset_from_complex_frequency(sweep, max_residual_norm=1e-3)
+    if onset is not None:
+        assert 1.0 < onset < 4.0
+
+
+def test_lambda1_root_converges_at_600k() -> None:
+    """Tracked lambda-unity solve should converge to a finite complex frequency."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point = solve_loop_lambda_unity(
+        cfg,
+        t_hot=600.0,
+        f_real_guess=20.0,
+        f_imag_guess=0.05,
+    )
+    assert point["converged"]
+    assert np.isfinite(point["frequency_real"])
+    assert np.isfinite(point["frequency_imag"])
+    assert np.isfinite(point["residual_norm"])
+
+
+def test_lambda1_fimag_nonzero_at_300k() -> None:
+    """At isothermal condition, tracked lambda-unity branch should have nonzero f_imag."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    point = solve_loop_lambda_unity(
+        cfg,
+        t_hot=300.0,
+        f_real_guess=20.0,
+        f_imag_guess=0.05,
+    )
+    assert np.isfinite(point["frequency_imag"])
+    assert abs(float(point["frequency_imag"])) > 1e-10
+
+
+def test_lambda1_scan_multi_temp_and_sweep() -> None:
+    """Multi-temperature scan and lambda-unity sweep should return finite values."""
+    cfg = tuned_traveling_wave_engine_candidate_config()
+    scan = scan_loop_eigenvalues_multi_temp(
+        cfg,
+        t_hot_values=np.array([300.0, 600.0]),
+        f_real_values=np.linspace(1.0, 50.0, 20),
+    )
+    assert 300.0 in scan and 600.0 in scan
+    assert len(scan[300.0]) == 20
+    sweep = sweep_loop_lambda_unity(
+        cfg,
+        t_hot_values=np.array([300.0, 500.0, 700.0]),
+        f_real_guess=20.0,
+        f_imag_guess=0.05,
+    )
+    vals = np.array([float(p["frequency_imag"]) for p in sweep], dtype=float)
+    assert np.all(np.isfinite(vals))

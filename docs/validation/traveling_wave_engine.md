@@ -17,6 +17,7 @@ Onset now supports both:
 
 - Gain-proxy crossing (`net_gain_proxy = 0`)
 - Complex-frequency crossing (`f_imag = 0`)
+- Determinant-based complex-frequency crossing (`det(M)=0`)
 
 ## Key Outputs
 
@@ -25,6 +26,19 @@ Implemented in `src/openthermoacoustics/validation/traveling_wave_engine.py`:
 - `find_onset_ratio_proxy`: coarse+fine gain-proxy onset ratio
 - `solve_traveling_wave_engine_complex_frequency`: complex-frequency solve
 - `sweep_traveling_wave_complex_frequency`: temperature continuation sweep
+- `compute_trunk_transfer_matrix` / `compute_branch_transfer_matrix`: per-path
+  linear transfer matrices
+- `build_boundary_matrix`: 3x3 loop-closure matrix `M(omega)`
+- `solve_traveling_wave_engine_determinant_complex_frequency`: 2x2
+  determinant solve for `(f_real, f_imag)`
+- `sweep_traveling_wave_determinant_complex_frequency`: determinant-based
+  continuation sweep
+- `sweep_traveling_wave_determinant_complex_frequency_multimode`: strict
+  determinant branch tracking across multiple seeded modes with physical
+  signature constraints
+- `evaluate_traveling_wave_boundary_determinant`: determinant diagnostics at a
+  specified complex frequency
+- `recover_mode_shape`: null-space mode reconstruction from `M(omega*)`
 - `detect_onset_from_complex_frequency`: onset ratio from `f_imag` crossing
   (with configurable deadband tolerance for numerical noise)
   and optional residual-quality filtering.
@@ -33,6 +47,14 @@ Implemented in `src/openthermoacoustics/validation/traveling_wave_engine.py`:
 - `summarize_multimode_selection`: compact selected-vs-alternate branch report.
 - `compute_regenerator_phase_profile`: inlet/mid/outlet phase diagnostics
 - `compute_loop_power_profile`: boundary acoustic powers by segment
+- `compute_net_acoustic_power`: net acoustic production/dissipation from full
+  branch+trunk power deltas
+- `compute_stored_energy`: first-order stored acoustic energy estimate from
+  distributed profiles
+- `compute_energy_balance_growth_rate`: growth-rate estimate
+  `f_imag ~= -W_net/(4*pi*E_stored)`
+- `sweep_energy_balance_growth_rate`: temperature sweep of
+  `W_net`, `E_stored`, and energy-balance `f_imag`
 - `compute_efficiency_estimate`: first-order efficiency estimate with Carnot bound
 - `sweep_efficiency_estimate`: temperature sweep of efficiency metrics
 - `estimate_loop_frequency_range`: quarter-wave + loop-loading sanity range
@@ -91,6 +113,19 @@ This keeps second-law consistency by construction and is useful for relative
 screening during geometry sweeps. It is not a full second-order enthalpy-flux
 efficiency model.
 
+Energy-balance onset diagnostics are also available from real-frequency 4x4
+solutions:
+
+- `W_net = sum(Delta W_segment)` (branch + trunk)
+- `E_stored` from pressure and kinetic first-order energy integrals
+- `f_imag,energy ~= -W_net/(4*pi*E_stored)`
+
+Interpretation with the existing sign convention:
+
+- `f_imag,energy > 0`: decaying mode (below onset)
+- `f_imag,energy = 0`: onset
+- `f_imag,energy < 0`: growing mode (above onset)
+
 ## Comparison to Published Ranges
 
 | Metric | This benchmark | Literature context |
@@ -102,11 +137,34 @@ efficiency model.
 Caveat: this geometry is not a direct replica of Backhaus & Swift hardware, so
 comparisons are qualitative/dimensionless.
 
-## Status and Next Step
+## Determinant Formulation
 
-- Distributed-loop plumbing is complete and tested.
-- Power/phase/efficiency diagnostics are in place for optimization loops.
-- The 5x5 augmentation is in place and produces non-trivial `f_imag` values.
-- Next milestone: tighten mode-tracking and reduce residuals further near
-  low-loss operating points (e.g., with adaptive frequency continuation windows
-  and optional phase-relaxation fallback).
+For loop eigenmodes we now support a normalization-free formulation:
+
+- Build trunk and branch transfer matrices:
+  `[p_out, U_out]^T = T(omega) [p_in, U_in]^T`
+- Assemble boundary matrix:
+  `M(omega) * [p1, U_trunk, U_branch]^T = 0`
+- Solve `det(M)=0` as a 2-real-equation root in `(f_real, f_imag)`.
+
+This removes the 5x5 normalization ambiguity and gives a direct eigenvalue
+criterion. The existing 4x4 and 5x5 solvers are still available for
+cross-checking and branch-selection diagnostics.
+
+Strict branch-identification layer:
+
+- Runs multiple determinant branches per temperature point.
+- Scores candidates by residual, frequency continuity, and two physical
+  signatures:
+  regenerator phase consistency and branch/trunk dominant power-flow sign.
+- Locks the selected branch to the identified physical mode instead of relying
+  only on frequency continuity penalties.
+
+Complex-frequency sensitivity diagnostic:
+
+- `scripts/determinant_landscape.py` generates:
+  - `examples/output/det_landscape_600K.png`
+  - `examples/output/transfer_matrix_sensitivity.txt`
+- Integrator now uses full complex `omega` in penetration depths
+  (`delta_nu`, `delta_kappa`) for thermoviscous evaluation, so determinant
+  and transfer matrices respond to nonzero `f_imag`.
