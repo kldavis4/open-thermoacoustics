@@ -44,7 +44,10 @@ jobs:
 
       - name: Run ruff
         if: steps.changed.outputs.files != ''
-        run: ruff check --extend-ignore N802,N803,N806 ${{ steps.changed.outputs.files }}
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          printf '%s\n' "$CHANGED_FILES" | xargs -r ruff check --extend-ignore N802,N803,N806
 
       - name: Skip ruff (no Python changes)
         if: steps.changed.outputs.files == ''
@@ -84,7 +87,10 @@ jobs:
 
       - name: Run mypy
         if: steps.changed.outputs.files != ''
-        run: mypy --ignore-missing-imports --follow-imports=silent ${{ steps.changed.outputs.files }}
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          printf '%s\n' "$CHANGED_FILES" | xargs -r mypy --ignore-missing-imports --follow-imports=silent
 
       - name: Skip mypy (no Python changes)
         if: steps.changed.outputs.files == ''
